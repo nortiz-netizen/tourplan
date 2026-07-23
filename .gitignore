@@ -1,0 +1,10 @@
+node_modules/
+.env
+capturas/
+
+# Artefactos de runtime con datos de leads reales
+resultado.json
+datos-entrada.json
+*.soql
+.soql-tmp.soql
+_*.apex

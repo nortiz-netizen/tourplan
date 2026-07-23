@@ -1,0 +1,22 @@
+{
+  "name": "tourplan-robot",
+  "version": "1.0.0",
+  "description": "",
+  "main": "index.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1",
+    "smoke": "node src/login-smoke.js",
+    "explorar": "node src/exploracion.js",
+    "clonar": "node src/clonar.js",
+    "worker": "node src/worker.js",
+    "opciones": "node src/opciones.js"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "module",
+  "dependencies": {
+    "dotenv": "^17.4.2",
+    "playwright": "^1.61.1"
+  }
+}
