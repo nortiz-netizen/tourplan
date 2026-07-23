@@ -9,7 +9,9 @@
     "explorar": "node src/exploracion.js",
     "clonar": "node src/clonar.js",
     "worker": "node src/worker.js",
-    "opciones": "node src/opciones.js"
+    "opciones": "node src/opciones.js",
+    "backend-explorar": "node src/backend-explorar.js",
+    "listar-files": "node src/listar-files.js"
   },
   "keywords": [],
   "author": "",

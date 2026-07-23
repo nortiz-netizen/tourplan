@@ -240,19 +240,59 @@ async function campoPorEtiqueta(fp, etiqueta) {
 async function seleccionarEnLista(fp, etiqueta, codigo) {
   const el = await campoPorEtiqueta(fp, etiqueta);
   if (!el) return false;
-  // Confirmado = el campo muestra "CODIGO - Nombre". Si solo quedo el texto
-  // tipeado (sin " - "), la opcion no se selecciono de verdad.
+  // Confirmado = el campo muestra "CODIGO - Nombre" Y ya no esta marcado invalido.
   const confirmado = async () => {
     const v = (await el.inputValue().catch(() => '')) || '';
-    return v.includes(' - ') && v.toUpperCase().includes(String(codigo).toUpperCase());
+    if (!(v.includes(' - ') && v.toUpperCase().includes(String(codigo).toUpperCase()))) return false;
+    // el borde rojo (tpinvalid/ng-invalid) significa que NO se comprometio la seleccion
+    const clase = (await el.getAttribute('class').catch(() => '')) || '';
+    return !/invalid/i.test(clase);
   };
   try {
+    // 1) Abrir el dropdown y CLICKEAR la opcion real (dispara el evento Angular).
     await el.click();
-    await sleep(300);
-    await el.press('Control+a').catch(() => {});
-    await el.type(String(codigo), { delay: 90 });   // la lista salta al codigo
     await sleep(700);
-    // Tres formas de cerrar la seleccion: no todas funcionan en todos los campos
+    const clickeado = await fp.evaluate(({ cod, etq }) => {
+      const norm = s => (s || '').trim().toUpperCase().replace(/\s+/g, ' ');
+      const lbl = [...document.querySelectorAll('label, span, div, td')]
+        .find(n => norm(n.textContent) === etq && n.getBoundingClientRect().width > 0);
+      if (!lbl) return false;
+      const lr = lbl.getBoundingClientRect();
+      const field = [...document.querySelectorAll('input')]
+        .filter(n => { const r = n.getBoundingClientRect(); return r.width > 0 && Math.abs(r.top - lr.top) < 20 && r.left > lr.left; })
+        .sort((a, b) => a.getBoundingClientRect().left - b.getBoundingClientRect().left)[0];
+      if (!field) return false;
+      const fr = field.getBoundingClientRect();
+      // opciones = hojas visibles cuyo texto empieza con el codigo. El dropdown
+      // puede abrir hacia ABAJO o hacia ARRIBA (campos bajos en la pantalla), asi
+      // que se busca en una banda vertical a ambos lados, excluyendo la fila del campo.
+      const codEsc = cod.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+      const re = new RegExp('^' + codEsc + '\\b', 'i');
+      const opt = [...document.querySelectorAll('*')].find(n => {
+        const r = n.getBoundingClientRect();
+        if (r.width <= 0 || r.height <= 0 || r.height > 40) return false;
+        if (r.top > fr.bottom + 450 || r.bottom < fr.top - 450) return false;  // banda arriba+abajo
+        if (Math.abs(r.top - fr.top) < 6) return false;                        // no es la fila del campo
+        if ([...n.children].some(h => (h.textContent || '').trim())) return false;
+        return re.test((n.textContent || '').trim());
+      });
+      if (!opt) return false;
+      opt.scrollIntoView({ block: 'nearest' });
+      // Disparar la secuencia completa: los dropdowns Angular suelen responder a
+      // mousedown, no solo a click. Con solo .click() la seleccion no se comprometia.
+      for (const type of ['pointerdown', 'mousedown', 'mouseup', 'click']) {
+        opt.dispatchEvent(new MouseEvent(type, { bubbles: true, cancelable: true, view: window }));
+      }
+      return true;
+    }, { cod: String(codigo), etq: etiqueta.toUpperCase() });
+    await sleep(500);
+    if (clickeado && await confirmado()) return true;
+
+    // 2) Fallback: escribir el codigo + teclas (por si la lista no se pudo clickear)
+    await el.click();
+    await el.press('Control+a').catch(() => {});
+    await el.type(String(codigo), { delay: 90 });
+    await sleep(700);
     for (const tecla of ['Enter', 'ArrowDown', 'Tab']) {
       if (await confirmado()) return true;
       await el.press(tecla).catch(() => {});
@@ -281,9 +321,12 @@ async function faseCamposIniciales(fp, fechaDDMMAA) {
   log(`  Fecha de viaje: ${fechaDDMMAA}`);
 
   // Campos de lista obligatorios (rojo). Sin los 4, GUARDAR queda deshabilitado.
+  // ORDEN CRITICO: AGENCIA primero. En Tourplan la agencia determina que
+  // division/departamento aplican, y al seleccionarla RESETEA esos campos.
+  // Si se llena la agencia al final, invalida division/depto ya cargados.
   for (const [etiqueta, valor] of [
-    ['MONEDA', CFG.moneda], ['DIVISIÓN', CFG.division],
-    ['DEPARTAMENTO', CFG.depto], ['AGENCIA', CFG.agencia],
+    ['AGENCIA', CFG.agencia], ['MONEDA', CFG.moneda],
+    ['DIVISIÓN', CFG.division], ['DEPARTAMENTO', CFG.depto],
   ]) {
     if (!valor) { log(`  ⚠ ${etiqueta} sin configurar — el booking NO se va a poder guardar`); continue; }
     const ok = await seleccionarEnLista(fp, etiqueta, valor);
@@ -345,23 +388,102 @@ async function capturarReferencia(fp) {
 async function faseGuardarBooking(fp) {
   const guardar = fp.getByRole('button', { name: /^guardar$/i }).first();
   if (!(await guardar.count())) throw new Error('No encontre el boton "Guardar" del modal');
+
+  // Si GUARDAR esta deshabilitado, algun campo obligatorio quedo invalido (rojo).
+  // Cortar ACA con un mensaje claro en vez de arrastrar el error a fases siguientes.
+  const habilitado = await guardar.isEnabled().catch(() => true);
+  if (!habilitado) {
+    const invalidos = await fp.$$eval('input', ns => ns
+      .filter(n => /invalid/i.test(n.getAttribute('class') || '') && n.getBoundingClientRect().width > 0)
+      .map(n => (n.getAttribute('class') || '').split(' ').find(c => /^tp/.test(c)) || 'campo')
+      .slice(0, 8)).catch(() => []);
+    await captura(fp, '15_guardar_deshabilitado');
+    throw new Error(`GUARDAR deshabilitado: campos obligatorios invalidos [${invalidos.join(', ')}]. Ver captura 15_guardar_deshabilitado.`);
+  }
+
   await guardar.click();
-  await esperarApp(fp); await sleep(1500);
-  await cerrarModalSiAparece(fp);
+  await esperarApp(fp);
+
+  // Tras Guardar, Tourplan puede mostrar modales de ADVERTENCIA (ej: "The booking
+  // name already exists"). Son avisos blandos: se aceptan con OK y guarda igual.
+  // Pueden aparecer con delay o encadenados → loop con reintentos.
+  for (let i = 0; i < 6; i++) {
+    await sleep(1200);
+    if (!(await modalBookingAbierto(fp))) break;   // ya cerro = guardado OK
+    let confirmo = false;
+    for (const txt of ['OK', 'Ok', 'Aceptar', 'Sí', 'Si', 'Yes', 'Continuar']) {
+      const b = fp.getByRole('button', { name: new RegExp('^' + txt + '$', 'i') }).first();
+      if (await b.count().catch(() => 0) && await b.isVisible().catch(() => false)) {
+        await b.click({ timeout: 2000 }).catch(() => {});
+        log(`  [advertencia] confirmada con "${txt}"`);
+        confirmo = true;
+        await sleep(600);
+      }
+    }
+    if (!confirmo && i >= 1) break;   // no hay mas modales para cerrar
+  }
+
+  // Verificar que el modal "Crear Booking" se cerro: si sigue abierto, no guardo.
+  if (await modalBookingAbierto(fp)) {
+    await captura(fp, '15_no_guardo');
+    throw new Error('El modal "Crear Booking" sigue abierto tras Guardar y confirmar advertencias — el guardado no se completo. Ver captura 15_no_guardo.');
+  }
   await captura(fp, '15_booking_guardado'); await volcarElementos(fp, 'booking_guardado');
-  log('  Booking guardado');
+  log('  Booking guardado (modal cerrado OK)');
 }
 
 async function faseInsertarServicios(fp) {
   if (!CFG.fileOrigen) throw new Error('FALTA TP_FILE_ORIGEN en .env — el codigo del file a clonar (viene de la consulta SQL). Sin el no hay paso 3.5.');
-  // Salir de la pantalla de insercion de linea (boton superior derecho)
+
+  // Tras guardar, Tourplan abre sola la pantalla "Inserción Línea Servicio".
+  // Salir de ella (guia 3.5) SIN cerrar el booking de atras: hay 2 botones "Salir",
+  // el de esta pantalla es el que esta MAS ARRIBA. Repetir hasta que desaparezca.
+  for (let i = 0; i < 4; i++) {
+    const enInsercion = await fp.getByText(/Inserci[oó]n\s+L[ií]nea\s+Servicio/i).first().isVisible().catch(() => false);
+    if (!enInsercion) break;
+    await fp.evaluate(() => {
+      const btns = [...document.querySelectorAll('button')]
+        .filter(b => /^\s*salir\s*$/i.test(b.textContent || '') && b.getBoundingClientRect().width > 0)
+        .sort((a, b) => a.getBoundingClientRect().top - b.getBoundingClientRect().top);
+      if (btns[0]) btns[0].click();   // el mas arriba = el de la pantalla de insercion
+    }).catch(() => {});
+    await sleep(1300);
+  }
+  // Salir de un booking vacio dispara el modal "Cancelar Booking". Cerrarlo con
+  // su propio "Salir" (el de MAS ABAJO; el de arriba es el del booking).
+  for (let i = 0; i < 3; i++) {
+    const cancelVisible = await fp.getByText(/^\s*Cancelar Booking\s*$/i).first().isVisible().catch(() => false);
+    if (!cancelVisible) break;
+    await fp.evaluate(() => {
+      const btns = [...document.querySelectorAll('button')]
+        .filter(b => /^\s*salir\s*$/i.test(b.textContent || '') && b.getBoundingClientRect().width > 0)
+        .sort((a, b) => b.getBoundingClientRect().top - a.getBoundingClientRect().top);
+      if (btns[0]) btns[0].click();   // el de mas abajo = el del modal Cancelar
+    }).catch(() => {});
+    await sleep(1000);
+    log('  [modal] Cancelar Booking cerrado');
+  }
   await cerrarModalSiAparece(fp);
-  // Menu → Itinerario → "Insertar booking"
-  const itin = fp.getByText(/^\s*Itinerario\s*$/i).first();
-  if (await itin.count()) { await itin.click(); await sleep(1000); }
+  await captura(fp, '16a_post_salir'); await volcarElementos(fp, 'post_salir');
+
+  // "Itinerario" es la 3ra seccion del menu hamburguesa (guia 3.5). Abrirlo.
+  let itin = fp.getByText(/^\s*Itinerario\s*$/i).first();
+  if (!(await itin.count().catch(() => 0))) {
+    for (const sel of ['[aria-label*="menu" i]', 'mat-icon:text("menu")', '[class*="hamburger"], [class*="menu-toggle"]']) {
+      const c = fp.locator(sel).first();
+      if (await c.count().catch(() => 0)) { await c.click({ timeout: 3000 }).catch(() => {}); break; }
+    }
+    await sleep(1000);
+    await captura(fp, '16b_menu_booking'); await volcarElementos(fp, 'menu_booking');
+    itin = fp.getByText(/^\s*Itinerario\s*$/i).first();
+  }
+  if (!(await itin.count().catch(() => 0))) {
+    throw new Error('No encontre "Itinerario" ni en la vista ni en el menu. Ver 16a_post_salir + 16b_menu_booking + JSONs.');
+  }
+  await itin.click(); await sleep(1200);
   await captura(fp, '16_itinerario'); await volcarElementos(fp, 'itinerario');
   const insertar = fp.getByText(/insertar\s+booking/i).last();
-  if (!(await insertar.count())) throw new Error('No encontre "Insertar booking" en Itinerario');
+  if (!(await insertar.count())) throw new Error('No encontre "Insertar booking" en Itinerario. Ver captura 16_itinerario + JSON.');
   await insertar.click(); await sleep(1000);
   // Buscador: pegar el codigo del file origen
   const buscador = fp.locator('input:visible').last();
@@ -383,10 +505,20 @@ async function faseReemplazarPrecios(fp) {
   else log('  ⚠ No aparecio el dialogo "Reemplazar todos" (puede venir despues) — capturando');
   await esperarApp(fp); await sleep(1500);
   await captura(fp, '18_precios'); await volcarElementos(fp, 'precios');
-  // Deteccion de error de disponibilidad (estacionalidad)
-  const body = (await fp.textContent('body')) || '';
-  if (/no\s+disponible|not\s+available|cerrad|closed|sin\s+disponibilidad/i.test(body)) {
-    throw Object.assign(new Error('DISPONIBILIDAD: servicio estacional cerrado'), { estacional: true });
+  // Deteccion de disponibilidad (estacionalidad) SOLO en alertas/dialogos visibles,
+  // NO en todo el body (evita falsos positivos que dispararian los 7 reintentos).
+  const alerta = await fp.evaluate(() => {
+    const sels = '[role="alert"], [class*="alert" i], [class*="dialog" i], [class*="toast" i], [class*="error" i], [class*="mensaje" i], [class*="warning" i]';
+    for (const n of document.querySelectorAll(sels)) {
+      const r = n.getBoundingClientRect();
+      if (r.width <= 0 || r.height <= 0) continue;
+      const t = (n.textContent || '').toLowerCase().replace(/\s+/g, ' ');
+      if (/no\s+disponible|not\s+available|sin\s+disponibilidad|no\s+operativ|servicio\s+cerrado/.test(t)) return t.slice(0, 160);
+    }
+    return null;
+  }).catch(() => null);
+  if (alerta) {
+    throw Object.assign(new Error('DISPONIBILIDAD (estacional): ' + alerta), { estacional: true });
   }
   log('FASE 3.6a OK — precios reemplazados (quedan en 999)');
 }
@@ -441,7 +573,13 @@ async function main() {
 
   let browser;
   for (const ch of ['chrome', 'msedge', undefined]) {
-    try { browser = await chromium.launch({ headless: false, slowMo: 120, channel: ch }); break; } catch { /* sig */ }
+    try {
+      browser = await chromium.launch({
+        headless: false, slowMo: 120, channel: ch,
+        args: ['--disable-features=Translate,TranslateUI', '--lang=es-CL'],
+      });
+      break;
+    } catch { /* sig */ }
   }
   if (!browser) { console.error('Sin navegador'); process.exit(1); }
   const context = await browser.newContext({ viewport: { width: 1600, height: 900 } });
