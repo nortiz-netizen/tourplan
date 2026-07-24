@@ -39,22 +39,35 @@ function cargarDatosExternos() {
 const DATOS = cargarDatosExternos();
 if (DATOS) console.log(`Datos recibidos desde Salesforce (Lead ${DATOS.leadId ?? 's/id'})`);
 
+/**
+ * Primer valor "con contenido". OJO: `??` solo cae al fallback con null/undefined,
+ * NO con string vacio. El JSON de Salesforce manda campos como agencia:"" cuando el
+ * dato no aplica, y eso pisaba el fallback del .env (el booking no se podia guardar).
+ * `primero()` trata ""/espacios como ausencia y sigue al proximo fallback.
+ */
+const primero = (...vals) => {
+  for (const v of vals) {
+    if (v !== undefined && v !== null && String(v).trim() !== '') return v;
+  }
+  return '';
+};
+
 const CFG = {
   url:   process.env.TP_URL,
   user:  process.env.TP_USER,
   pass:  process.env.TP_PASS,
-  // Datos del booking: primero lo que mande Salesforce, si no el .env
+  // Datos del booking: primero lo que mande Salesforce, si no el .env (primer no-vacio)
   leadId:      DATOS?.leadId      ?? null,
-  paxNombre:   DATOS?.paxNombre   ?? process.env.TP_PAX_NOMBRE   ?? 'Prueba Robot',
+  paxNombre:   primero(DATOS?.paxNombre, process.env.TP_PAX_NOMBRE, 'Prueba Robot'),
   paxCantidad: DATOS?.paxCantidad ?? parseInt(process.env.TP_PAX_CANTIDAD || '2', 10),
-  fechaViaje:  DATOS?.fechaViaje  ?? process.env.TP_FECHA_VIAJE  ?? '',   // ISO o DDMMAA
-  alias:       DATOS?.alias       ?? process.env.TP_ALIAS        ?? 'wonderful trip for you',
-  agencia:     DATOS?.agencia     ?? process.env.TP_AGENCIA      ?? '',
-  depto:       DATOS?.depto       ?? process.env.TP_DEPTO        ?? '',
-  division:    DATOS?.division    ?? process.env.TP_DIVISION     ?? 'WE',    // WE = Web
-  moneda:      DATOS?.moneda      ?? process.env.TP_MONEDA       ?? 'USD',
+  fechaViaje:  primero(DATOS?.fechaViaje, process.env.TP_FECHA_VIAJE),   // ISO o DDMMAA
+  alias:       primero(DATOS?.alias, process.env.TP_ALIAS, 'wonderful trip for you'),
+  agencia:     primero(DATOS?.agencia, process.env.TP_AGENCIA),
+  depto:       primero(DATOS?.depto, process.env.TP_DEPTO),
+  division:    primero(DATOS?.division, process.env.TP_DIVISION, 'WE'),    // WE = Web
+  moneda:      primero(DATOS?.moneda, process.env.TP_MONEDA, 'USD'),
   // File origen a clonar (viene de la consulta SQL) — SIN esto no hay paso 3.5
-  fileOrigen:  DATOS?.fileOrigen  ?? process.env.TP_FILE_ORIGEN  ?? '',
+  fileOrigen:  primero(DATOS?.fileOrigen, process.env.TP_FILE_ORIGEN),
   // Protocolo estacionalidad
   maxIntentos:        parseInt(process.env.TP_MAX_INTENTOS || '7', 10),
   desplazamientoDias: parseInt(process.env.TP_DESPLAZAMIENTO_DIAS || '1', 10),
@@ -435,56 +448,46 @@ async function faseGuardarBooking(fp) {
 async function faseInsertarServicios(fp) {
   if (!CFG.fileOrigen) throw new Error('FALTA TP_FILE_ORIGEN en .env — el codigo del file a clonar (viene de la consulta SQL). Sin el no hay paso 3.5.');
 
-  // Tras guardar, Tourplan abre sola la pantalla "Inserción Línea Servicio".
-  // Salir de ella (guia 3.5) SIN cerrar el booking de atras: hay 2 botones "Salir",
-  // el de esta pantalla es el que esta MAS ARRIBA. Repetir hasta que desaparezca.
-  for (let i = 0; i < 4; i++) {
-    const enInsercion = await fp.getByText(/Inserci[oó]n\s+L[ií]nea\s+Servicio/i).first().isVisible().catch(() => false);
-    if (!enInsercion) break;
-    await fp.evaluate(() => {
-      const btns = [...document.querySelectorAll('button')]
-        .filter(b => /^\s*salir\s*$/i.test(b.textContent || '') && b.getBoundingClientRect().width > 0)
-        .sort((a, b) => a.getBoundingClientRect().top - b.getBoundingClientRect().top);
-      if (btns[0]) btns[0].click();   // el mas arriba = el de la pantalla de insercion
-    }).catch(() => {});
-    await sleep(1300);
-  }
-  // Salir de un booking vacio dispara el modal "Cancelar Booking". Cerrarlo con
-  // su propio "Salir" (el de MAS ABAJO; el de arriba es el del booking).
-  for (let i = 0; i < 3; i++) {
-    const cancelVisible = await fp.getByText(/^\s*Cancelar Booking\s*$/i).first().isVisible().catch(() => false);
-    if (!cancelVisible) break;
-    await fp.evaluate(() => {
-      const btns = [...document.querySelectorAll('button')]
-        .filter(b => /^\s*salir\s*$/i.test(b.textContent || '') && b.getBoundingClientRect().width > 0)
-        .sort((a, b) => b.getBoundingClientRect().top - a.getBoundingClientRect().top);
-      if (btns[0]) btns[0].click();   // el de mas abajo = el del modal Cancelar
-    }).catch(() => {});
-    await sleep(1000);
-    log('  [modal] Cancelar Booking cerrado');
-  }
-  await cerrarModalSiAparece(fp);
-  await captura(fp, '16a_post_salir'); await volcarElementos(fp, 'post_salir');
+  await sleep(1200);
+  await captura(fp, '16_pantalla_3_5'); await volcarElementos(fp, 'pantalla_3_5');
 
-  // "Itinerario" es la 3ra seccion del menu hamburguesa (guia 3.5). Abrirlo.
-  let itin = fp.getByText(/^\s*Itinerario\s*$/i).first();
-  if (!(await itin.count().catch(() => 0))) {
-    for (const sel of ['[aria-label*="menu" i]', 'mat-icon:text("menu")', '[class*="hamburger"], [class*="menu-toggle"]']) {
-      const c = fp.locator(sel).first();
-      if (await c.count().catch(() => 0)) { await c.click({ timeout: 3000 }).catch(() => {}); break; }
+  // "Insertar booking" (clonar) — OJO: distinto de "Insertar Nuevo Booking" (crear).
+  // El regex /insertar\s+booking/ NO matchea "Insertar Nuevo Booking" (hay "Nuevo"
+  // en el medio). Con el viewport ANCHO ya no deberia estar cortado a la derecha.
+  const buscarInsertar = () => fp.getByText(/insertar\s+booking/i).first();
+
+  let insertar = buscarInsertar();
+  if (!(await insertar.count().catch(() => 0))) {
+    // Cerrar SOLO el modal "Inserción Línea Servicio": su "Salir" esta en la fila
+    // del TITULO del modal. El otro "Salir" (mas arriba, barra gris) es el del
+    // booking y lo abandonaria → disparaba "Cancelar Booking". Se distingue por Y.
+    for (let i = 0; i < 3; i++) {
+      const estado = await fp.evaluate(() => {
+        const titulo = [...document.querySelectorAll('*')]
+          .find(n => /^\s*Inserci.n\s+L.nea\s+Servicio\s*$/i.test((n.textContent || '').trim()) && n.getBoundingClientRect().width > 0);
+        if (!titulo) return 'sin-modal';
+        const T = titulo.getBoundingClientRect().top;
+        const salir = [...document.querySelectorAll('button')].find(b => {
+          const r = b.getBoundingClientRect();
+          return /^\s*salir\s*$/i.test(b.textContent || '') && r.width > 0 && Math.abs(r.top - T) < 45;
+        });
+        if (!salir) return 'sin-salir';
+        salir.click();
+        return 'click';
+      }).catch(() => 'error');
+      if (estado === 'sin-modal') break;
+      await sleep(1500);
     }
-    await sleep(1000);
-    await captura(fp, '16b_menu_booking'); await volcarElementos(fp, 'menu_booking');
-    itin = fp.getByText(/^\s*Itinerario\s*$/i).first();
+    await cerrarModalSiAparece(fp);
+    await captura(fp, '16b_itinerario_booking'); await volcarElementos(fp, 'itinerario_booking');
+    insertar = buscarInsertar();
   }
-  if (!(await itin.count().catch(() => 0))) {
-    throw new Error('No encontre "Itinerario" ni en la vista ni en el menu. Ver 16a_post_salir + 16b_menu_booking + JSONs.');
+  if (!(await insertar.count().catch(() => 0))) {
+    throw new Error('No encontre "Insertar booking" (clonar). Ver 16_pantalla_3_5 + 16b_itinerario_booking + JSONs.');
   }
-  await itin.click(); await sleep(1200);
-  await captura(fp, '16_itinerario'); await volcarElementos(fp, 'itinerario');
-  const insertar = fp.getByText(/insertar\s+booking/i).last();
-  if (!(await insertar.count())) throw new Error('No encontre "Insertar booking" en Itinerario. Ver captura 16_itinerario + JSON.');
-  await insertar.click(); await sleep(1000);
+  await insertar.scrollIntoViewIfNeeded().catch(() => {});
+  await insertar.click(); await sleep(1200);
+  await captura(fp, '16c_insertar_booking'); await volcarElementos(fp, 'insertar_booking');
   // Buscador: pegar el codigo del file origen
   const buscador = fp.locator('input:visible').last();
   await tipear(fp, buscador, CFG.fileOrigen);
@@ -571,18 +574,34 @@ async function main() {
     process.exit(0);
   }
 
+  // HEADLESS: en tu PC va visible (para ver/depurar). En AWS (sin pantalla) tiene
+  // que ir headless → se activa con TP_HEADLESS=true en el .env del servidor.
+  // slowMo solo en modo visible; en headless corre a full para no perder tiempo.
+  const headless = /^true|1|si$/i.test(process.env.TP_HEADLESS || '');
+  const argsBase = ['--disable-features=Translate,TranslateUI', '--lang=es-CL'];
+  const argsHeadless = ['--no-sandbox', '--disable-dev-shm-usage', '--disable-gpu']; // requeridos en contenedores/AWS
+
   let browser;
-  for (const ch of ['chrome', 'msedge', undefined]) {
+  // En headless conviene el Chromium empaquetado de Playwright (no depende del
+  // Chrome del sistema, que en un server no esta). En visible, el Chrome del sistema.
+  const canales = headless ? [undefined, 'chrome'] : ['chrome', 'msedge', undefined];
+  for (const ch of canales) {
     try {
       browser = await chromium.launch({
-        headless: false, slowMo: 120, channel: ch,
-        args: ['--disable-features=Translate,TranslateUI', '--lang=es-CL'],
+        headless,
+        slowMo: headless ? 0 : 120,
+        channel: ch,
+        args: headless ? [...argsBase, ...argsHeadless] : argsBase,
       });
+      log(`Navegador: ${headless ? 'HEADLESS' : 'visible'} (${ch ?? 'chromium empaquetado'})`);
       break;
-    } catch { /* sig */ }
+    } catch { /* siguiente */ }
   }
   if (!browser) { console.error('Sin navegador'); process.exit(1); }
-  const context = await browser.newContext({ viewport: { width: 1600, height: 900 } });
+  // Viewport ANCHO: Tourplan es mas ancho que 1600px y corta botones a la derecha
+  // (ej. "Insertar booking"). La guia menciona zoom 75% "para visibilidad total de
+  // los controles" — aca se resuelve con una ventana ancha, mas confiable.
+  const context = await browser.newContext({ viewport: { width: 2200, height: 1050 } });
   const page = await context.newPage();
   page.on('dialog', async d => { log(`  [dialog] ${d.type()}: ${d.message().slice(0, 100)}`); await d.accept().catch(() => {}); });
 
@@ -592,7 +611,7 @@ async function main() {
     await captura(page, '09_home'); await volcarElementos(page, 'home');
 
     // Protocolo de estacionalidad: hasta N intentos desplazando la fecha
-    let exito = false, refFinal = null;
+    let exito = false, refFinal = null, ultimaRef = null;
     for (let intento = 1; intento <= CFG.maxIntentos && !exito; intento++) {
       const fecha = fechaIntento(CFG.fechaViaje, (intento - 1) * CFG.desplazamientoDias);
       log(`\n===== INTENTO ${intento}/${CFG.maxIntentos} — fecha ${fecha} =====`);
@@ -602,6 +621,7 @@ async function main() {
         await faseCamposIniciales(fitsPage, fecha);
         await faseHabitaciones(fitsPage);
         const ref = await capturarReferencia(fitsPage);   // se asigna al abrir el modal
+        ultimaRef = ref;                                  // se recuerda por si algo falla despues de guardar
         await faseGuardarBooking(fitsPage);
         await faseInsertarServicios(fitsPage);
         await faseReemplazarPrecios(fitsPage);
@@ -638,7 +658,9 @@ async function main() {
     await captura(p, '90_error'); await volcarElementos(p, 'error');
     log('El robot se detuvo AQUI — la captura 90 + JSON muestran la pantalla exacta para ajustar el selector.');
     fs.writeFileSync('resultado.json', JSON.stringify({
-      leadId: CFG.leadId, estado: 'ERROR', motivo: e.message.split('\n')[0],
+      // Si el booking ya se habia guardado (falla despues, ej. paso 3.5), igual
+      // dejamos la referencia para no perder la reserva creada en Tourplan.
+      leadId: CFG.leadId, estado: 'ERROR', referencia: ultimaRef, motivo: e.message.split('\n')[0],
     }, null, 1));
   } finally {
     if (fitsPage !== page && fitsPage && !fitsPage.isClosed()) await fitsPage.close().catch(() => {});
