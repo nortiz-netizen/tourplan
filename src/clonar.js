@@ -606,12 +606,13 @@ async function main() {
   page.on('dialog', async d => { log(`  [dialog] ${d.type()}: ${d.message().slice(0, 100)}`); await d.accept().catch(() => {}); });
 
   let fitsPage = page;
+  let ultimaRef = null;   // fuera del try: el catch (error) tambien la necesita
   try {
     await login(page);
     await captura(page, '09_home'); await volcarElementos(page, 'home');
 
     // Protocolo de estacionalidad: hasta N intentos desplazando la fecha
-    let exito = false, refFinal = null, ultimaRef = null;
+    let exito = false, refFinal = null;
     for (let intento = 1; intento <= CFG.maxIntentos && !exito; intento++) {
       const fecha = fechaIntento(CFG.fechaViaje, (intento - 1) * CFG.desplazamientoDias);
       log(`\n===== INTENTO ${intento}/${CFG.maxIntentos} — fecha ${fecha} =====`);
