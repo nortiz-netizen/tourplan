@@ -451,54 +451,20 @@ async function faseInsertarServicios(fp) {
   await sleep(1200);
   await captura(fp, '16_pantalla_3_5'); await volcarElementos(fp, 'pantalla_3_5');
 
-  // "Insertar booking" (clonar) — OJO: distinto de "Insertar Nuevo Booking" (crear).
-  // El regex /insertar\s+booking/ NO matchea "Insertar Nuevo Booking" (hay "Nuevo"
-  // en el medio). Con el viewport ANCHO ya no deberia estar cortado a la derecha.
-  const buscarInsertar = () => fp.getByText(/insertar\s+booking/i).first();
-
-  let insertar = buscarInsertar();
-  if (!(await insertar.count().catch(() => 0))) {
-    // Cerrar SOLO el modal "Inserción Línea Servicio": su "Salir" esta en la fila
-    // del TITULO del modal. El otro "Salir" (mas arriba, barra gris) es el del
-    // booking y lo abandonaria → disparaba "Cancelar Booking". Se distingue por Y.
-    for (let i = 0; i < 3; i++) {
-      const estado = await fp.evaluate(() => {
-        const titulo = [...document.querySelectorAll('*')]
-          .find(n => /^\s*Inserci.n\s+L.nea\s+Servicio\s*$/i.test((n.textContent || '').trim()) && n.getBoundingClientRect().width > 0);
-        if (!titulo) return 'sin-modal';
-        const T = titulo.getBoundingClientRect().top;
-        const salir = [...document.querySelectorAll('button')].find(b => {
-          const r = b.getBoundingClientRect();
-          return /^\s*salir\s*$/i.test(b.textContent || '') && r.width > 0 && Math.abs(r.top - T) < 45;
-        });
-        if (!salir) return 'sin-salir';
-        salir.click();
-        return 'click';
-      }).catch(() => 'error');
-      if (estado === 'sin-modal') break;
-      await sleep(1500);
-    }
-    await cerrarModalSiAparece(fp);
-    await captura(fp, '16b_itinerario_booking'); await volcarElementos(fp, 'itinerario_booking');
-    insertar = buscarInsertar();
-  }
-  if (!(await insertar.count().catch(() => 0))) {
-    throw new Error('No encontre "Insertar booking" (clonar). Ver 16_pantalla_3_5 + 16b_itinerario_booking + JSONs.');
-  }
-  await insertar.scrollIntoViewIfNeeded().catch(() => {});
-  await insertar.click(); await sleep(1200);
-  await captura(fp, '16c_insertar_booking'); await volcarElementos(fp, 'insertar_booking');
-  // Buscador: pegar el codigo del file origen
-  const buscador = fp.locator('input:visible').last();
-  await tipear(fp, buscador, CFG.fileOrigen);
-  await fp.keyboard.press('Enter');
-  await esperarApp(fp); await sleep(1500);
-  await captura(fp, '17_resultados_busqueda'); await volcarElementos(fp, 'busqueda');
-  // Primera coincidencia EXACTA
-  const fila = fp.getByText(CFG.fileOrigen, { exact: false }).first();
-  if (!(await fila.count())) throw new Error(`El file origen "${CFG.fileOrigen}" no aparece en los resultados`);
-  await fila.click(); await sleep(800);
-  log('FASE 3.5 hecha — file origen seleccionado');
+  // PASO 3.5 (clonar los servicios del file) — BLOQUEADO por falta de ground truth.
+  // El booking YA se creo y guardo con los datos reales del lead. Pero la secuencia
+  // exacta para CLONAR los servicios de un file existente NO se puede derivar de
+  // capturas estaticas: se probaron 3 hipotesis y ninguna funciono:
+  //   1) "Insertar booking"        -> ese boton no existe en Tourplan.
+  //   2) "Insertar Nuevo Booking"  -> esta en otra pantalla, no en la de servicios.
+  //   3) lookup de booking          -> el click da timeout (no es la via).
+  // Los controles reales de la pantalla de servicios son: "Insertar Nuevo Servicio"
+  // (tpinsertservice), "Buscar Productos" (tpfindproducts) y un lookup (tplookupbooking),
+  // pero CUAL clona el file y EN QUE ORDEN requiere ver el flujo manual.
+  // >>> PENDIENTE: video del clon manual (Carlos/Alveiro). <<<
+  // Se corta limpio aca (sin clicks a ciegas que cuelgan): la 16_pantalla_3_5 + su JSON
+  // quedan como diagnostico para ajustar los selectores apenas tengamos el video.
+  throw new Error(`Booking creado y guardado OK, pero falta clonar los servicios del file ${CFG.fileOrigen} (paso 3.5). PENDIENTE: video del flujo manual de clonacion. Ver 16_pantalla_3_5 + JSON.`);
 }
 
 async function faseReemplazarPrecios(fp) {
