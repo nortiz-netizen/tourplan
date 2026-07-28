@@ -32,6 +32,7 @@ const ORG          = process.env.SF_ORG || 'sayhueque-sb';
 const INTERVALO_MS = parseInt(process.env.WORKER_INTERVALO_MS || '60000', 10);
 const UNA_VEZ      = process.argv.includes('--una-vez');
 const SIMULAR      = process.argv.includes('--simular');   // no abre Tourplan, solo muestra el mapeo
+const COLA         = process.argv.includes('--cola');      // solo lista los leads en cola, no procesa
 const LOTE         = parseInt(process.env.WORKER_LOTE || '5', 10);  // cuantos pendientes agarra por ciclo
 
 const sleep = (ms) => new Promise(r => setTimeout(r, ms));
@@ -197,6 +198,17 @@ async function unaVuelta(ciclo) {
 }
 
 async function main() {
+  // --cola: solo muestra la cola de leads pendientes (no procesa nada).
+  if (COLA) {
+    const leads = leadsPendientes(50);
+    log(`📋 Cola: ${leads.length} lead(s) pendiente(s) de clonar`);
+    for (const l of leads) {
+      const d = leadATourplan(l);
+      log(`  • ${l.Id} — ${d.paxNombre} | ${d.destinos || 'sin destino'} | file: ${d.fileOrigen || '(sin plantilla)'} | ${l.Estado_Clonacion__c || 'nuevo'}`);
+    }
+    if (!leads.length) log('  (vacia — no hay leads esperando)');
+    return;
+  }
   log(`Worker iniciado — org ${ORG}, cada ${INTERVALO_MS / 1000}s${SIMULAR ? ' [SIMULACION]' : ''}${UNA_VEZ ? ' [una vez]' : ''}`);
   let ciclo = 0;
   // Loop con espera AL FINAL de cada ciclo: nunca se solapan dos corridas.
