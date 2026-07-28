@@ -176,16 +176,26 @@ async function logout(page) {
 // ------------------------- FASES DEL FLUJO -------------------------
 
 async function faseNavegarFits(page, context) {
-  // Menu superior izquierdo
-  for (const sel of ['[aria-label*="menu" i]', 'button:has(mat-icon:text("menu"))', 'mat-icon:text("menu")', '[class*="hamburger"], [class*="menu-toggle"]']) {
-    const c = page.locator(sel).first();
-    if (await c.count().catch(() => 0)) { await c.click({ timeout: 3000 }).catch(() => {}); break; }
-  }
-  await sleep(800);
-  await captura(page, '10_menu'); await volcarElementos(page, 'menu');
-
+  // A veces el menu carga INCOMPLETO (timing: la app todavia no renderizo la nav,
+  // aparecen ~5 elementos). Se reintenta abrir el menu y encontrar "Bookings y
+  // cotizaciones" hasta 4 veces, esperando a que la app termine entre intentos.
+  const abrirMenu = async () => {
+    for (const sel of ['[aria-label*="menu" i]', 'button:has(mat-icon:text("menu"))', 'mat-icon:text("menu")', '[class*="hamburger"], [class*="menu-toggle"]']) {
+      const c = page.locator(sel).first();
+      if (await c.count().catch(() => 0)) { await c.click({ timeout: 3000 }).catch(() => {}); break; }
+    }
+    await sleep(1000);
+  };
   const bookings = page.getByText(/bookings\s*(y|and)\s*(cotizaciones|quotes)/i).first();
-  if (!(await bookings.count())) throw new Error('No encontre "Bookings y cotizaciones" en el menu');
+  let ok = false;
+  for (let intento = 1; intento <= 4; intento++) {
+    await abrirMenu();
+    if (await bookings.count().catch(() => 0)) { ok = true; break; }
+    log(`  menu incompleto (intento ${intento}/4) — espero a que cargue la app y reintento`);
+    await esperarApp(page); await sleep(1800);
+  }
+  await captura(page, '10_menu'); await volcarElementos(page, 'menu');
+  if (!ok) throw new Error('No encontre "Bookings y cotizaciones" en el menu (tras 4 reintentos)');
   await bookings.click(); await sleep(800);
 
   const nueva = context.waitForEvent('page', { timeout: 8000 }).catch(() => null);
