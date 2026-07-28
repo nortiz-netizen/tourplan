@@ -18,6 +18,7 @@ import { chromium } from 'playwright';
 import dotenv from 'dotenv';
 import fs from 'node:fs';
 import { aDDMMAA, calcularHabitaciones } from './mapeo.js';
+import { generarLink, siteDesdeBackendLink } from './backend.js';
 dotenv.config();
 
 // ------------------------------ CONFIG ------------------------------
@@ -607,10 +608,26 @@ async function main() {
 
     if (exito) {
       log(`\n✅ CLONACION COMPLETA. Referencia nueva: ${refFinal ?? '(no detectada, ver capturas)'}`);
-      log(`Siguiente paso (backend): pegar ${refFinal ?? 'la ref'} en backend.sayhueque.com → ${CFG.backendLink ?? 'SWEK/SAT'} → idioma ${CFG.idiomaBackend} → generar link.`);
+
+      // PASO 4 — backend: con la referencia recien creada, generar el link del itinerario.
+      // Si algo falla, NO se pierde la clonacion: se guarda OK igual y el link queda pendiente.
+      let linkItinerario = null, backendMotivo = null;
+      const refBackend = refFinal ?? ultimaRef;
+      if (refBackend) {
+        log(`Paso 4 (backend): generando link para ref ${refBackend} → ${CFG.backendLink} / ${CFG.idiomaBackend}...`);
+        const rb = await generarLink(browser, {
+          referencia: refBackend,
+          site: siteDesdeBackendLink(CFG.backendLink),
+          idioma: CFG.idiomaBackend,
+        }).catch(e => ({ estado: 'ERROR', motivo: String(e.message).split('\n')[0] }));
+        if (rb.estado === 'OK' && rb.link) { linkItinerario = rb.link; log(`  ✅ Link: ${linkItinerario}`); }
+        else { backendMotivo = rb.motivo || rb.estado; log(`  ⚠ Backend sin link: ${backendMotivo}`); }
+      }
+
       fs.writeFileSync('resultado.json', JSON.stringify({
         leadId: CFG.leadId, estado: 'OK', referencia: refFinal,
         backendLink: CFG.backendLink, idioma: CFG.idiomaBackend,
+        linkItinerario, backendMotivo,
       }, null, 1));
     } else {
       log('\n🛑 Sin disponibilidad tras todos los intentos → protocolo "Taylor Made": abortar y derivar a venta especializada.');

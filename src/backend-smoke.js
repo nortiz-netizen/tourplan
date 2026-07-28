@@ -79,16 +79,20 @@ async function main() {
       const body = (await page.textContent('body').catch(() => '')) || '';
       log('  Texto post-login (primeros 300): ' + body.replace(/\s+/g, ' ').slice(0, 300));
 
-      // 3) Ir a la seccion FIT (donde se pega la ref y se genera el link) y fotografiar.
-      const fit = page.getByRole('link', { name: /^FIT$/i }).first();
-      if (await fit.count().catch(() => 0)) {
-        await fit.click().catch(() => {});
-        await sleep(3500);
-        await captura(page, '03_fit'); await volcar(page, 'fit');
-        const bodyFit = (await page.textContent('body').catch(() => '')) || '';
-        log('  Texto FIT (primeros 400): ' + bodyFit.replace(/\s+/g, ' ').slice(0, 400));
+      // 3) La home YA es la pantalla FIT (buscador Code/ID/Reference + Find).
+      //    Probar si nuestra ref de test aparece en el backend: pegar en Reference + Find.
+      const ref = process.argv[2] || '120177';
+      const refInput = page.locator('input.form-control').nth(2); // orden: Code, ID, Reference, Search
+      if (await refInput.count().catch(() => 0)) {
+        await refInput.click(); await refInput.fill(''); await refInput.pressSequentially(ref, { delay: 60 });
+        log(`  Reference = ${ref} → Find...`);
+        await page.getByRole('button', { name: /^Find$/i }).first().click().catch(() => {});
+        await sleep(4000);
+        await captura(page, '03_find_result'); await volcar(page, 'find_result');
+        const bodyFind = (await page.textContent('body').catch(() => '')) || '';
+        log('  Texto tras Find (primeros 400): ' + bodyFind.replace(/\s+/g, ' ').slice(0, 400));
       } else {
-        log('  ⚠ No encontre el nav "FIT" — ver 02_post_login + JSON.');
+        log('  ⚠ No encontre el campo Reference — ver 02_post_login + JSON.');
       }
     } else {
       log('  ⚠ No encontre inputs de login estandar — ver 01_login + JSON.');
