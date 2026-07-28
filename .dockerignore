@@ -1,0 +1,8 @@
+node_modules
+capturas
+.env
+datos-entrada.json
+resultado.json
+.git
+.gitignore
+*.md
