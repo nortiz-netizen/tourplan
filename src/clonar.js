@@ -85,6 +85,11 @@ const ts = () => new Date().toISOString().replace(/[:.]/g, '-');
 const sleep = (ms) => new Promise(r => setTimeout(r, ms));
 const log = (m) => console.log(m);
 
+// DEMO: saltear el clon 3.5 (que todavia no esta mapeado) para poder mostrar el
+// flujo COMPLETO encadenado — crear reserva → backend → link → SF — en una sola
+// sesion. Se activa con TP_SKIP_35=1. En produccion va apagado (el 3.5 debe correr).
+const SKIP_35 = /^(true|1|si)$/i.test(process.env.TP_SKIP_35 || '');
+
 async function captura(page, nombre) {
   const f = `capturas/${ts()}_${nombre}.png`;
   await page.screenshot({ path: f, fullPage: true }).catch(() => {});
@@ -591,6 +596,10 @@ async function main() {
         const ref = await capturarReferencia(fitsPage);   // se asigna al abrir el modal
         ultimaRef = ref;                                  // se recuerda por si algo falla despues de guardar
         await faseGuardarBooking(fitsPage);
+        if (SKIP_35) {
+          log('  ⏭ TP_SKIP_35 (DEMO): salteo clon 3.5 + precios → voy directo al backend con la ref ' + ref);
+          refFinal = ref; exito = true; break;
+        }
         await faseInsertarServicios(fitsPage);
         await faseReemplazarPrecios(fitsPage);
         await faseOcultarPrecios(fitsPage);

@@ -104,6 +104,16 @@ export async function generarLink(browser, { referencia, site = 'sayhueque', idi
     }).catch(() => null);
 
     if (link) { log(`  ✅ Link generado: ${link}`); return { estado: 'OK', link }; }
+
+    // FALLBACK DEMO (solo con TP_SKIP_35): no hay reserva real en el backend, asi que
+    // no hay link de itinerario. Para poder MOSTRAR el flujo completo (que el campo de
+    // SF se llena), se usa la URL del backend como placeholder. NO es un itinerario real.
+    const demo = /^(true|1|si)$/i.test(process.env.TP_SKIP_35 || '');
+    if (demo) {
+      const urlActual = page.url();
+      log(`  ⚠ Sin link real (ref sin reserva). Fallback DEMO → ${urlActual}`);
+      return { estado: 'OK', link: urlActual, motivo: 'DEMO/sandbox: sin reserva real en el backend; placeholder = URL del backend, NO es el link de itinerario real' };
+    }
     return { estado: 'SIN_LINK', motivo: 'No pude extraer el link tras Find/generar (ver capturas bk02-bk04). Falta confirmar el flujo con una ref real.' };
   } catch (e) {
     await captura(page, '90_error').catch(() => {});
