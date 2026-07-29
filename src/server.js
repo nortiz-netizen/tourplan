@@ -16,7 +16,7 @@
  * Correr:  npm run server   (o node src/server.js)
  */
 import express from 'express';
-import { spawnSync } from 'node:child_process';
+import { spawn } from 'node:child_process';
 import fs from 'node:fs';
 import dotenv from 'dotenv';
 import { leadATourplan } from './mapeo.js';
@@ -74,7 +74,7 @@ async function procesarCola() {
     } else if (!datos.fileOrigen) {
       r = { estado: 'SIN_PLANTILLA', motivo: 'Sin plantilla para el destino' };
     } else {
-      r = ejecutarRobot(datos);
+      r = await ejecutarRobot(datos);
     }
     resultados.push({ leadId: id, ...r });
     log(`  -> ${id}: ${r.estado}${r.referencia ? ' / ' + r.referencia : ''}`);
@@ -87,12 +87,19 @@ async function procesarCola() {
   }
 }
 
+// spawn ASINCRONO (no spawnSync): NO bloquea el event loop, asi el server sigue
+// respondiendo /estado y /resultados mientras el scraper corre. Devuelve una Promise.
 function ejecutarRobot(datos) {
-  fs.writeFileSync('datos-entrada.json', JSON.stringify(datos, null, 1));
-  if (fs.existsSync('resultado.json')) fs.unlinkSync('resultado.json');
-  const p = spawnSync(process.execPath, ['src/clonar.js', '--datos', 'datos-entrada.json'], { encoding: 'utf8', stdio: 'inherit' });
-  if (fs.existsSync('resultado.json')) return JSON.parse(fs.readFileSync('resultado.json', 'utf8'));
-  return { estado: 'ERROR', motivo: `El robot no dejo resultado (exit ${p.status})` };
+  return new Promise((resolve) => {
+    fs.writeFileSync('datos-entrada.json', JSON.stringify(datos, null, 1));
+    if (fs.existsSync('resultado.json')) fs.unlinkSync('resultado.json');
+    const p = spawn(process.execPath, ['src/clonar.js', '--datos', 'datos-entrada.json'], { stdio: 'inherit' });
+    p.on('close', (code) => {
+      if (fs.existsSync('resultado.json')) resolve(JSON.parse(fs.readFileSync('resultado.json', 'utf8')));
+      else resolve({ estado: 'ERROR', motivo: `El robot no dejo resultado (exit ${code})` });
+    });
+    p.on('error', (e) => resolve({ estado: 'ERROR', motivo: String(e.message).split('\n')[0] }));
+  });
 }
 
 app.listen(PORT, () => log(`Scraper HTTP escuchando en :${PORT} (auth: ${TOKEN ? 'token ON' : 'SIN TOKEN ⚠'})`));
