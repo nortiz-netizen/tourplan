@@ -9,6 +9,7 @@
     "explorar": "node src/exploracion.js",
     "clonar": "node src/clonar.js",
     "worker": "node src/worker.js",
+    "server": "node src/server.js",
     "opciones": "node src/opciones.js",
     "backend-explorar": "node src/backend-explorar.js",
     "listar-files": "node src/listar-files.js"
@@ -19,6 +20,7 @@
   "type": "module",
   "dependencies": {
     "dotenv": "^17.4.2",
+    "express": "^4.21.2",
     "playwright": "^1.61.1"
   }
 }
