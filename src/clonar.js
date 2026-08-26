@@ -1,5 +1,5 @@
 /**
- * ROBOT DE CLONACION COMPLETO — Tourplan V3 (guia Say Hueque)
+ * ROBOT DE CLONACION COMPLETO — Tourplan V4 (guia Say Hueque)
  *
  * Ejecuta el flujo entero:
  *   login → FITs → nuevo booking → campos → habitaciones → guardar (captura REF)
@@ -83,7 +83,22 @@ const CFG = {
 
 const ts = () => new Date().toISOString().replace(/[:.]/g, '-');
 const sleep = (ms) => new Promise(r => setTimeout(r, ms));
-const log = (m) => console.log(m);
+
+// Bitacora: todo lo que se loguea queda tambien guardado para mandarselo a
+// Salesforce. Sin esto, un SIN_DISPONIBILIDAD llega sin explicacion y el
+// vendedor no tiene como saber que intento el robot ni por que se rindio.
+const BITACORA = [];
+const log = (m) => { console.log(m); BITACORA.push(String(m)); };
+// Se manda la COLA del log, no el principio: el campo del Lead aguanta 2000
+// caracteres y lo que importa es como termino, no como arranco.
+const bitacoraTexto = () => BITACORA.join('\n').slice(-1900);
+
+/** DDMMAA -> yyyy-MM-dd, que es lo que Apex puede convertir con Date.valueOf(). */
+function ddmmaaAIso(ddmmaa) {
+  const s = String(ddmmaa || '').replace(/\D/g, '');
+  if (s.length !== 6) return null;
+  return `20${s.slice(4, 6)}-${s.slice(2, 4)}-${s.slice(0, 2)}`;
+}
 
 // DEMO: saltear el clon 3.5 (que todavia no esta mapeado) para poder mostrar el
 // flujo COMPLETO encadenado — crear reserva → backend → link → SF — en una sola
@@ -467,20 +482,136 @@ async function faseInsertarServicios(fp) {
   await sleep(1200);
   await captura(fp, '16_pantalla_3_5'); await volcarElementos(fp, 'pantalla_3_5');
 
-  // PASO 3.5 (clonar los servicios del file) — BLOQUEADO por falta de ground truth.
-  // El booking YA se creo y guardo con los datos reales del lead. Pero la secuencia
-  // exacta para CLONAR los servicios de un file existente NO se puede derivar de
-  // capturas estaticas: se probaron 3 hipotesis y ninguna funciono:
-  //   1) "Insertar booking"        -> ese boton no existe en Tourplan.
-  //   2) "Insertar Nuevo Booking"  -> esta en otra pantalla, no en la de servicios.
-  //   3) lookup de booking          -> el click da timeout (no es la via).
-  // Los controles reales de la pantalla de servicios son: "Insertar Nuevo Servicio"
-  // (tpinsertservice), "Buscar Productos" (tpfindproducts) y un lookup (tplookupbooking),
-  // pero CUAL clona el file y EN QUE ORDEN requiere ver el flujo manual.
-  // >>> PENDIENTE: video del clon manual (Carlos/Alveiro). <<<
-  // Se corta limpio aca (sin clicks a ciegas que cuelgan): la 16_pantalla_3_5 + su JSON
-  // quedan como diagnostico para ajustar los selectores apenas tengamos el video.
-  throw new Error(`Booking creado y guardado OK, pero falta clonar los servicios del file ${CFG.fileOrigen} (paso 3.5). PENDIENTE: video del flujo manual de clonacion. Ver 16_pantalla_3_5 + JSON.`);
+  // PASO 3.5 segun la guia V4. Lo que estaba bloqueado era el ORDEN, no el boton:
+  // al guardar, Tourplan deja abierta la pantalla de insercion de linea, y el
+  // "Insertar booking" NO esta ahi. Hay que SALIR primero (boton arriba a la
+  // derecha) e ir a la tercera seccion del menu, "Itinerario": ahi, como ultimo
+  // boton, aparece el que clona. Por eso las 3 hipotesis viejas fallaban.
+
+  // 3.5.a — salir de la pantalla de insercion de linea
+  const salir = fp.locator('button, [role="button"], a').filter({ hasText: /^\s*(salir|cerrar|cancelar|close|exit)\s*$/i }).last();
+  if (await salir.count().catch(() => 0)) {
+    await salir.click().catch(() => {});
+    log('  Sali de la pantalla de insercion de linea');
+  } else {
+    // Fallback: Escape suele cerrar el panel de linea sin tocar el booking
+    await fp.keyboard.press('Escape').catch(() => {});
+    log('  ⚠ No encontre boton de salida — probe con Escape (ver captura 16)');
+  }
+  await esperarApp(fp); await sleep(900);
+
+  // 3.5.b — tercera seccion del menu: Itinerario
+  const itinerario = fp.getByText(/^\s*itinerari[oa]\s*$/i).first();
+  if (!(await itinerario.count().catch(() => 0))) {
+    await captura(fp, '16b_sin_itinerario'); await volcarElementos(fp, 'sin_itinerario');
+    throw new Error('No encontre la seccion "Itinerario" (paso 3.5.b). Ver captura 16b + JSON.');
+  }
+  await itinerario.click();
+  await esperarApp(fp); await sleep(1200);
+  await captura(fp, '17_itinerario'); await volcarElementos(fp, 'itinerario');
+
+  // 3.5.c — "Insertar booking": la guia dice que es el ULTIMO boton de la seccion
+  let insertar = fp.getByRole('button', { name: /insertar\s+booking/i }).first();
+  if (!(await insertar.count().catch(() => 0))) {
+    insertar = fp.getByText(/insertar\s+booking/i).first();
+  }
+  if (!(await insertar.count().catch(() => 0))) {
+    await volcarElementos(fp, 'itinerario_sin_boton');
+    throw new Error('No encontre "Insertar booking" dentro de Itinerario (paso 3.5.c). Ver JSON itinerario_sin_boton.');
+  }
+  await insertar.click();
+  await esperarApp(fp); await sleep(1200);
+  await captura(fp, '17b_buscador_file');
+
+  // 3.5.d — pegar el codigo EXACTO del file que salio de la consulta SQL
+  const buscador = fp.locator('input[type="text"]:visible, input[type="search"]:visible').last();
+  if (!(await buscador.count().catch(() => 0))) {
+    await volcarElementos(fp, 'buscador_file');
+    throw new Error('No encontre el campo de busqueda del file (paso 3.5.d). Ver JSON buscador_file.');
+  }
+  await tipear(fp, buscador, CFG.fileOrigen);
+  await fp.keyboard.press('Enter').catch(() => {});
+  await esperarApp(fp); await sleep(1600);
+  await captura(fp, '17c_resultados'); await volcarElementos(fp, 'resultados_file');
+
+  // 3.5.e — primera opcion, verificando que sea la coincidencia EXACTA.
+  // La guia insiste en "verificando que sea la coincidencia exacta": clonar el
+  // file equivocado le arma al pasajero un viaje que no pidio, y eso no se nota
+  // hasta que alguien lee la cotizacion. Mejor abortar que clonar cualquier cosa.
+  const fila = fp.locator(`tr:has-text("${CFG.fileOrigen}"), li:has-text("${CFG.fileOrigen}"), [role="row"]:has-text("${CFG.fileOrigen}")`).first();
+  if (!(await fila.count().catch(() => 0))) {
+    throw new Error(`La busqueda no devolvio el file ${CFG.fileOrigen} (paso 3.5.e). Ver captura 17c.`);
+  }
+  await fila.click();
+  await esperarApp(fp); await sleep(1500);
+  await captura(fp, '17d_file_seleccionado');
+  log(`FASE 3.5 OK — servicios del file ${CFG.fileOrigen} insertados`);
+}
+
+/**
+ * PASO 3.7 (V4) — validacion por COLOR de las lineas del itinerario.
+ * Blanca = el servicio se inserto bien. Roja = no opera en esa fecha.
+ * Es la unica forma de saber si el clon sirve: Tourplan no tira error, pinta.
+ */
+async function faseValidarLineas(fp) {
+  const itinerario = fp.getByText(/^\s*itinerari[oa]\s*$/i).first();
+  if (await itinerario.count().catch(() => 0)) {
+    await itinerario.click().catch(() => {});
+    await esperarApp(fp); await sleep(1200);
+  }
+  await captura(fp, '17e_validacion_color');
+
+  const rojas = await fp.evaluate(() => {
+    const esRojo = (c) => {
+      const m = /rgba?\(\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)/.exec(c || '');
+      if (!m) return false;
+      const [r, g, b] = [ +m[1], +m[2], +m[3] ];
+      // rojo "de verdad": componente roja dominante y clara sobre las otras dos
+      return r > 130 && r - g > 55 && r - b > 55;
+    };
+    const filas = document.querySelectorAll('tr, [role="row"]');
+    const malas = [];
+    for (const f of filas) {
+      const st = getComputedStyle(f);
+      let rojo = esRojo(st.backgroundColor) || esRojo(st.color);
+      if (!rojo) {
+        for (const c of f.querySelectorAll('td, [role="cell"]')) {
+          const cs = getComputedStyle(c);
+          if (esRojo(cs.backgroundColor) || esRojo(cs.color)) { rojo = true; break; }
+        }
+      }
+      if (rojo) malas.push((f.textContent || '').trim().replace(/\s+/g, ' ').slice(0, 90));
+    }
+    return malas;
+  }).catch(() => []);
+
+  if (rojas.length) {
+    log(`  ⚠ ${rojas.length} servicio(s) en ROJO — no operan en la fecha elegida`);
+    rojas.slice(0, 3).forEach(r => log(`     · ${r}`));
+    throw Object.assign(new Error('DISPONIBILIDAD (lineas rojas): ' + rojas.slice(0, 2).join(' | ')), { estacional: true });
+  }
+  log('FASE 3.7 OK — todas las lineas blancas, el file se inserto correctamente');
+}
+
+/**
+ * Seccion 4 (V4), ultimo recurso: si en la fecha original tampoco hay
+ * disponibilidad, se ocultan las fechas para poder mandar igual la cotizacion.
+ */
+async function faseOcultarFechas(fp) {
+  await fp.evaluate(() => { document.documentElement.style.zoom = '0.75'; }).catch(() => {});
+  const analisis = fp.getByText(/^\s*An[aá]lisis\s*$/i).first();
+  if (await analisis.count().catch(() => 0)) { await analisis.click(); await sleep(1000); }
+  const ocultar = fp.getByLabel(/ocultar\s+fechas/i).first();
+  if (await ocultar.count().catch(() => 0)) {
+    await ocultar.selectOption({ label: 'SI' }).catch(async () => { await ocultar.click().catch(() => {}); });
+    log('  "Ocultar Fechas" → SI');
+  } else {
+    const txt = fp.getByText(/ocultar\s+fechas/i).first();
+    if (await txt.count().catch(() => 0)) { await txt.click().catch(() => {}); log('  "Ocultar Fechas" clickeado (verificar captura)'); }
+    else log('  ⚠ No encontre "Ocultar Fechas" — ver JSON');
+  }
+  await fp.evaluate(() => { document.documentElement.style.zoom = '1'; }).catch(() => {});
+  await captura(fp, '19b_ocultar_fechas'); await volcarElementos(fp, 'ocultar_fechas');
 }
 
 async function faseReemplazarPrecios(fp) {
@@ -552,6 +683,7 @@ async function main() {
     fs.writeFileSync('resultado.json', JSON.stringify({
       leadId: CFG.leadId, estado: 'LUJO_SIN_PROCESAR',
       motivo: `Palabras clave de lujo: ${(CFG.lujoMotivo || []).join(', ')}`,
+      log: bitacoraTexto(),
     }, null, 1));
     process.exit(0);
   }
@@ -593,11 +725,25 @@ async function main() {
     await login(page);
     await captura(page, '09_home'); await volcarElementos(page, 'home');
 
-    // Protocolo de estacionalidad: hasta N intentos desplazando la fecha
-    let exito = false, refFinal = null;
-    for (let intento = 1; intento <= CFG.maxIntentos && !exito; intento++) {
-      const fecha = fechaIntento(CFG.fechaViaje, (intento - 1) * CFG.desplazamientoDias);
-      log(`\n===== INTENTO ${intento}/${CFG.maxIntentos} — fecha ${fecha} =====`);
+    // Protocolo de disponibilidad de la guia V4 (seccion 4). Ya no son 7 intentos
+    // a ciegas corriendo la fecha: son 4 pasos con un proposito cada uno.
+    //   1) la fecha que pidio el pasajero
+    //   2) +1 dia
+    //   3) +2 dias   (la guia permite "hasta 2 intentos desplazando la fecha")
+    //   4) vuelta a la fecha ORIGINAL, y si valida, se ocultan las fechas para
+    //      poder mandar igual la cotizacion
+    // Si despues de eso siguen las lineas rojas -> abortar y derivar a Taylor Made.
+    const PLAN = [
+      { dias: 0, ocultarFechas: false, nota: 'fecha pedida' },
+      { dias: 1, ocultarFechas: false, nota: '+1 dia' },
+      { dias: 2, ocultarFechas: false, nota: '+2 dias' },
+      { dias: 0, ocultarFechas: true,  nota: 'fecha original, ocultando fechas' },
+    ];
+    let exito = false, refFinal = null, fechaUsada = null, fechasOcultas = false;
+    for (let i = 0; i < PLAN.length && !exito; i++) {
+      const paso  = PLAN[i];
+      const fecha = fechaIntento(CFG.fechaViaje, paso.dias);
+      log(`\n===== INTENTO ${i + 1}/${PLAN.length} — ${paso.nota} (${fecha}) =====`);
       try {
         fitsPage = await faseNavegarFits(page, context);
         await faseNuevoBooking(fitsPage);
@@ -608,16 +754,19 @@ async function main() {
         await faseGuardarBooking(fitsPage);
         if (SKIP_35) {
           log('  ⏭ TP_SKIP_35 (DEMO): salteo clon 3.5 + precios → voy directo al backend con la ref ' + ref);
-          refFinal = ref; exito = true; break;
+          refFinal = ref; fechaUsada = fecha; exito = true; break;
         }
         await faseInsertarServicios(fitsPage);
+        await faseValidarLineas(fitsPage);                // 3.7 — blancas o rojas
         await faseReemplazarPrecios(fitsPage);
         await faseOcultarPrecios(fitsPage);
+        if (paso.ocultarFechas) { await faseOcultarFechas(fitsPage); fechasOcultas = true; }
         refFinal = await faseGuardarYCerrar(fitsPage, page, ref);
+        fechaUsada = fecha;
         exito = true;
       } catch (e) {
-        if (e.estacional && intento < CFG.maxIntentos) {
-          log(`  Estacionalidad detectada — reintento con fecha +${CFG.desplazamientoDias * intento} dia(s)`);
+        if (e.estacional && i < PLAN.length - 1) {
+          log(`  Sin disponibilidad en ${fecha} — paso al siguiente intento: ${PLAN[i + 1].nota}`);
           if (fitsPage !== page && !fitsPage.isClosed()) await fitsPage.close().catch(() => {});
           continue;
         }
@@ -647,12 +796,19 @@ async function main() {
         leadId: CFG.leadId, estado: 'OK', referencia: refFinal,
         backendLink: CFG.backendLink, idioma: CFG.idiomaBackend,
         linkItinerario, backendMotivo,
+        // V4: si el robot corrio la fecha o escondio las fechas, el vendedor
+        // tiene que enterarse ANTES de mandarle la cotizacion al pasajero.
+        fechaViajeUsada: ddmmaaAIso(fechaUsada),
+        fechasOcultas,
+        log: bitacoraTexto(),
       }, null, 1));
     } else {
       log('\n🛑 Sin disponibilidad tras todos los intentos → protocolo "Taylor Made": abortar y derivar a venta especializada.');
       fs.writeFileSync('resultado.json', JSON.stringify({
         leadId: CFG.leadId, estado: 'SIN_DISPONIBILIDAD',
-        motivo: `Sin disponibilidad tras ${CFG.maxIntentos} intentos desplazando fecha`,
+        motivo: 'Sin disponibilidad en la fecha pedida, +1 dia, +2 dias ni ocultando fechas (guia V4 seccion 4)',
+        fechasOcultas,
+        log: bitacoraTexto(),
       }, null, 1));
     }
   } catch (e) {
@@ -664,6 +820,7 @@ async function main() {
       // Si el booking ya se habia guardado (falla despues, ej. paso 3.5), igual
       // dejamos la referencia para no perder la reserva creada en Tourplan.
       leadId: CFG.leadId, estado: 'ERROR', referencia: ultimaRef, motivo: e.message.split('\n')[0],
+      log: bitacoraTexto(),
     }, null, 1));
   } finally {
     if (fitsPage !== page && fitsPage && !fitsPage.isClosed()) await fitsPage.close().catch(() => {});
