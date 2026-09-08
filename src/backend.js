@@ -81,27 +81,42 @@ export async function generarLink(browser, { referencia, site = 'sayhueque', idi
     await sleep(4000);
     await captura(page, 'bk02_find'); await volcar(page, 'find');
 
-    // ---- ⚠️ HIPOTESIS (falta confirmar con ref real): elegir sitio + idioma + generar ----
-    // El sitio (sayhueque/saysouthamerica) y el idioma (EN/ES/DE/IT) aparecen en la
-    // barra; se seleccionan por texto. Ajustar selectores con la captura bk02/bk03.
+    // ---- ELEGIR SITIO + IDIOMA ----
+    // Son pestanias que RE-RENDERIZAN la fila de resultado con otra URL (el mismo
+    // file sale como yourtrip/…/testing y con Lang=EN|ES|DE|IT segun lo elegido).
+    // Por eso se clickean ANTES de extraer y se espera a que la tabla se rearme.
     await page.getByText(new RegExp('^\\s*' + site + '\\s*$', 'i')).first().click().catch(() => {});
+    await sleep(1200);
     await page.getByText(new RegExp('^\\s*' + idioma + '\\s*$', 'i')).first().click().catch(() => {});
-    await sleep(1500);
+    await sleep(2000);
     await captura(page, 'bk03_opciones'); await volcar(page, 'opciones');
 
-    // Generar el link (boton tipico). Ajustar con la captura si el texto difiere.
-    const gen = page.getByRole('button', { name: /generate|generar|link|itinerar|pdf|crear|create|view/i }).first();
-    if (await gen.count().catch(() => 0)) { await gen.click().catch(() => {}); await sleep(3500); }
+    // NO se clickea ningun boton de "generar": el backend no tiene tal paso. Despues
+    // del Find la tabla YA trae la URL en su columna. El codigo viejo buscaba un boton
+    // con /generate|link|view/i y en esa tabla lo unico que matchea es el "Copy"/"View"
+    // de la fila — clickearlo navegaba a otra pagina y se perdia el resultado. Ese era
+    // el motivo por el que el link volvia vacio.
     await captura(page, 'bk04_link'); await volcar(page, 'link');
 
     // ---- EXTRAER EL LINK ----
-    // Busca un <a href> o un input con una URL que parezca del itinerario.
-    const link = await page.evaluate(() => {
-      const cand = [];
-      for (const a of document.querySelectorAll('a[href^="http"]')) cand.push(a.href);
-      for (const i of document.querySelectorAll('input')) { const v = i.value || ''; if (/^https?:\/\//.test(v)) cand.push(v); }
-      return cand.find(h => /itiner|trip|book|view|share|tripplan|proposal/i.test(h)) || cand[0] || null;
-    }).catch(() => null);
+    // Se busca el href que contenga la REFERENCIA que pedimos (Code=WEFI…). Anclar en
+    // la referencia es lo unico seguro: si la tabla trae varias filas, o quedo el
+    // resultado de una busqueda anterior, el "primer link que parezca de itinerario"
+    // puede ser el de OTRO pasajero, y mandarle a un cliente el viaje de otro es peor
+    // que no mandarle nada.
+    const ref = String(referencia);
+    const link = await page.evaluate((ref) => {
+      const urls = [];
+      for (const a of document.querySelectorAll('a[href^="http"]')) urls.push(a.href);
+      for (const i of document.querySelectorAll('input, textarea')) {
+        const v = i.value || ''; if (/^https?:\/\//.test(v)) urls.push(v);
+      }
+      // 1) el que trae nuestra referencia en el query string
+      const exacto = urls.find(u => new RegExp('[?&]Code=' + ref + '(&|$)', 'i').test(u));
+      if (exacto) return exacto;
+      // 2) el que la trae en cualquier parte de la URL
+      return urls.find(u => u.toUpperCase().includes(ref.toUpperCase())) || null;
+    }, ref).catch(() => null);
 
     if (link) { log(`  ✅ Link generado: ${link}`); return { estado: 'OK', link }; }
 
@@ -114,7 +129,16 @@ export async function generarLink(browser, { referencia, site = 'sayhueque', idi
       log(`  ⚠ Sin link real (ref sin reserva). Fallback DEMO → ${urlActual}`);
       return { estado: 'OK', link: urlActual, motivo: 'DEMO/sandbox: sin reserva real en el backend; placeholder = URL del backend, NO es el link de itinerario real' };
     }
-    return { estado: 'SIN_LINK', motivo: 'No pude extraer el link tras Find/generar (ver capturas bk02-bk04). Falta confirmar el flujo con una ref real.' };
+    // Sin link NO se inventa uno. El ID interno del backend (?ID=28114) no se puede
+    // derivar de la referencia: aunque en las corridas viejas la diferencia diera
+    // constante, basta que el backend saltee un numero para que el link apunte al
+    // itinerario de otro pasajero.
+    return {
+      estado: 'SIN_LINK',
+      motivo: `El backend no devolvio ninguna URL con la referencia ${ref} tras el Find. ` +
+              `Revisar capturas bk02_find y bk04_link: puede que la referencia todavia no ` +
+              `este publicada en el sitio "${site}", o que el Find no haya traido resultados.`
+    };
   } catch (e) {
     await captura(page, '90_error').catch(() => {});
     return { estado: 'ERROR', motivo: String(e.message).split('\n')[0] };
