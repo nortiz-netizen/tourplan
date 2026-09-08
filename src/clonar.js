@@ -177,13 +177,50 @@ async function login(page) {
   log('FASE 0 OK — sesion activa');
 }
 
+/** Primer elemento realmente visible de un locator (no solo presente en el DOM). */
+async function primerVisible(loc) {
+  const n = await loc.count().catch(() => 0);
+  for (let i = 0; i < Math.min(n, 12); i++) {
+    const c = loc.nth(i);
+    if (await c.isVisible().catch(() => false)) return c;
+  }
+  return null;
+}
+
 async function logout(page) {
+  // Tourplan no tiene un boton de logout suelto: esta dentro del menu del
+  // usuario, arriba a la derecha ("conectado como QUI" + flecha). Y el rotulo
+  // existe en el DOM aun con el menu cerrado, asi que hay que exigir que sea
+  // VISIBLE antes de clickearlo. Sin logout la licencia queda tomada y la
+  // corrida siguiente entra en QUERY MODE (la guia V4 lo pide explicitamente).
+  const rotulos = /^\s*(logout|log\s*out|cerrar\s+sesi[oó]n|salir\s+del\s+sistema|desconectar)\s*$/i;
   try {
-    const cand = page.locator(
-      'button:has-text("Logout"), a:has-text("Logout"), [aria-label*="logout" i], [title*="logout" i], [aria-label*="salir" i], button:has-text("Log out")'
-    ).first();
-    if (await cand.count()) { await cand.click({ timeout: 4000 }); await sleep(2000); log('Logout OK — licencia liberada'); }
-    else { log('⚠ Logout no encontrado — revisar elementos_home.json'); await volcarElementos(page, 'sin_logout'); }
+    let cand = await primerVisible(page.getByText(rotulos));
+
+    if (!cand) {
+      const usuario = await primerVisible(page.getByText(/conectado\s+como/i));
+      if (usuario) {
+        await usuario.click({ timeout: 5000, force: true }).catch(() => {});
+        await sleep(1500);
+        await captura(page, '98_menu_usuario'); await volcarElementos(page, 'menu_usuario');
+        cand = await primerVisible(page.getByText(rotulos));
+      }
+    }
+
+    if (!cand) {
+      cand = await primerVisible(page.locator(
+        'button:has-text("Logout"), a:has-text("Logout"), [aria-label*="logout" i], [title*="logout" i], button:has-text("Log out")'
+      ));
+    }
+
+    if (cand) {
+      await cand.click({ timeout: 5000 });
+      await sleep(2500);
+      log('Logout OK — licencia liberada');
+    } else {
+      log('⚠ Logout no encontrado — revisar elementos_menu_usuario.json');
+      await volcarElementos(page, 'sin_logout');
+    }
   } catch (e) { log('⚠ Logout fallo: ' + e.message.split('\n')[0]); }
   await captura(page, '99_post_logout');
 }
@@ -422,6 +459,13 @@ async function capturarReferencia(fp) {
     const v = (await campo.inputValue().catch(() => '')).trim();
     if (v) { log(`  REF BOOKING: ${v}`); return v; }
   }
+  // Cerrado el modal de creacion, la referencia queda en la cabecera del
+  // booking (la misma que se ve arriba a la izquierda en toda la app).
+  const cabecera = fp.locator('input[class*="bookingfullreference" i]').first();
+  if (await cabecera.count().catch(() => 0)) {
+    const v = (await cabecera.inputValue().catch(() => '')).trim();
+    if (v) { log(`  REF BOOKING: ${v}`); return v; }
+  }
   const body = (await fp.textContent('body')) || '';
   const m = body.match(/\b\d{6,8}\b/);
   const ref = m ? m[0] : null;
@@ -476,76 +520,514 @@ async function faseGuardarBooking(fp) {
   log('  Booking guardado (modal cerrado OK)');
 }
 
+/**
+ * Abre el menu lateral izquierdo de Tourplan y lo MANTIENE abierto.
+ *
+ * El menu es <div class="tpnav">. Cuando esta colapsado lleva ademas la clase
+ * "nav-closed" y mide unos 75px: sus items (RESUMEN, ITINERARIO, ...) no estan
+ * ocultos por CSS, no existen en el DOM. Se despliega al pasar el mouse por
+ * encima y se vuelve a cerrar en cuanto el puntero sale.
+ *
+ * Eso explica los tres sintomas que veniamos viendo: el clic por texto daba
+ * timeout (el item no existia), el clic en la fila padre "funcionaba" pero
+ * dejaba el menu cerrado (el mouse habia salido), y en el intento siguiente
+ * la seccion ya no aparecia.
+ *
+ * La regla, entonces: mantener el puntero DENTRO del nav mientras se navega.
+ */
+async function menuAbierto(fp) {
+  return (await fp.locator('.nav-closed').count().catch(() => 0)) === 0;
+}
+
+async function abrirMenuLateral(fp) {
+  const nav = fp.locator('div.tpnav, [class*="tpnav"]').first();
+  if (await menuAbierto(fp)) { log('  Menu lateral ya estaba abierto'); return true; }
+
+  // 1) Pasar el mouse por encima: es como lo abre una persona.
+  await nav.hover({ timeout: 3000 }).catch(() => {});
+  await sleep(700);
+  if (await menuAbierto(fp)) { log('  Menu lateral abierto (hover sobre el nav)'); return true; }
+
+  // 2) La hamburguesa, que lo deja fijo.
+  const hamb = fp.locator('img[class*="hamburger" i], [class*="hamburger" i]').first();
+  if (await hamb.count().catch(() => 0)) {
+    await hamb.click({ timeout: 3000 }).catch(() => {});
+    await sleep(900);
+    if (await menuAbierto(fp)) { log('  Menu lateral abierto (hamburguesa)'); return true; }
+  }
+
+  // 3) Ultimo recurso: sobre la franja, por coordenada.
+  await fp.mouse.move(45, 300).catch(() => {});
+  await sleep(800);
+  if (await menuAbierto(fp)) { log('  Menu lateral abierto (mouse sobre la franja)'); return true; }
+
+  log('  No pude abrir el menu lateral (sigue con clase nav-closed)');
+  return false;
+}
+
+/**
+ * Abre una seccion del menu lateral y entra a uno de sus items.
+ *
+ * El nav (div.tpnav) se despliega al pasarle el mouse y se cierra al salir, y
+ * las secciones son plegables: mientras estan plegadas sus items NO existen en
+ * el DOM. Por eso hay que re-hoverear antes de cada clic y reintentar.
+ * Devuelve true si entro al item.
+ */
+async function abrirItemMenu(fp, seccionRx, itemRx, etiqueta) {
+  await abrirMenuLateral(fp);
+  await sleep(800);
+  const nav = fp.locator('div.tpnav, [class*="tpnav"]').first();
+
+  for (let intento = 1; intento <= 4; intento++) {
+    let item = fp.getByText(itemRx).first();
+    if (await item.count().catch(() => 0)) {
+      // force: el nav esta animando y nunca pasa el chequeo de estabilidad.
+      await item.click({ timeout: 5000, force: true }).catch(() => {});
+      await esperarApp(fp); await sleep(1600);
+      log('  Menu: entre a ' + etiqueta);
+      return true;
+    }
+    await nav.hover({ timeout: 3000 }).catch(() => {});
+    await sleep(600);
+    const seccion = fp.getByText(seccionRx).first();
+    if (!(await seccion.count().catch(() => 0))) {
+      log('  Menu: la seccion de ' + etiqueta + ' no esta visible (intento ' + intento + '/4) — reabro el nav');
+      await abrirMenuLateral(fp);
+      continue;
+    }
+    await seccion.click({ timeout: 4000, force: true }).catch(() => {});
+    await fp.getByText(itemRx).first().waitFor({ state: 'visible', timeout: 5000 }).catch(() => {});
+  }
+
+  // Volcado del nav para poder ajustar el selector sin adivinar.
+  const items = await fp.evaluate(() => {
+    const out = [];
+    document.querySelectorAll('*').forEach((e) => {
+      const r = e.getBoundingClientRect();
+      if (r.width === 0 || r.height === 0 || r.left > 300 || r.width > 320) return;
+      if (e.childElementCount !== 0) return;
+      const t = (e.textContent || '').replace(/\s+/g, ' ').trim();
+      if (t) out.push(t.slice(0, 40));
+    });
+    return out.slice(0, 40);
+  }).catch(() => []);
+  log('  ⚠ Menu: no encontre ' + etiqueta + '. Items visibles del nav: ' + items.join(' | '));
+  return false;
+}
+
+/**
+ * Marca una de las opciones tipo radio de Tourplan.
+ *
+ * No son input[type="radio"]: son <input> sin type y el seleccionado se
+ * distingue por la clase "checked". Buscarlos por tipo devolvia siempre vacio
+ * y quedaba marcada la opcion por defecto. Se ubica el input subiendo desde el
+ * rotulo hasta el primer contenedor que tenga UNO solo.
+ */
+async function marcarOpcion(fp, textoExacto) {
+  return await fp.evaluate((texto) => {
+    const norm = (t) => (t || '').replace(/\s+/g, ' ').trim().toLowerCase();
+    const buscado = norm(texto);
+    const candidatos = [...document.querySelectorAll('*')]
+      .filter((e) => norm(e.textContent) === buscado)
+      .sort((a, b) => a.getElementsByTagName('*').length - b.getElementsByTagName('*').length);
+    const rotulo = candidatos[0];
+    if (!rotulo) return 'sin rotulo';
+
+    let n = rotulo, control = null;
+    for (let i = 0; i < 6 && n; i++) {
+      const ins = n.querySelectorAll('input');
+      if (ins.length === 1) { control = ins[0]; break; }
+      if (ins.length > 1) break;   // nos pasamos: este contenedor tiene varias opciones
+      n = n.parentElement;
+    }
+    if (!control) return 'sin control';
+
+    control.click();
+    control.dispatchEvent(new Event('change', { bubbles: true }));
+    const clases = (control.className || '').toString();
+    return /checked/i.test(clases) || control.checked ? 'ok' : 'clickeado pero sigue sin "checked" (' + clases.slice(0, 40) + ')';
+  }, textoExacto).catch((e) => 'error: ' + e.message);
+}
+
 async function faseInsertarServicios(fp) {
   if (!CFG.fileOrigen) throw new Error('FALTA TP_FILE_ORIGEN en .env — el codigo del file a clonar (viene de la consulta SQL). Sin el no hay paso 3.5.');
 
   await sleep(1200);
   await captura(fp, '16_pantalla_3_5'); await volcarElementos(fp, 'pantalla_3_5');
 
-  // PASO 3.5 segun la guia V4. Lo que estaba bloqueado era el ORDEN, no el boton:
-  // al guardar, Tourplan deja abierta la pantalla de insercion de linea, y el
-  // "Insertar booking" NO esta ahi. Hay que SALIR primero (boton arriba a la
-  // derecha) e ir a la tercera seccion del menu, "Itinerario": ahi, como ultimo
-  // boton, aparece el que clona. Por eso las 3 hipotesis viejas fallaban.
+  // PASO 3.5, corregido con las capturas de la guia V4.
+  //
+  // Esto estuvo trabado por una suposicion equivocada: se buscaba "Insertar
+  // booking" entre los BOTONES del panel. No esta ahi. En esa botonera solo hay
+  // "Insertar Nuevo Servicio", "Insertas servcio de texto", "Buscar Productos"
+  // y "Buscar Proveedores". "INSERTAR BOOKING" es el ULTIMO item del MENU
+  // LATERAL izquierdo, dentro de la seccion desplegable ITINERARIO. Si la
+  // seccion esta plegada el item no existe en el DOM, y por eso toda busqueda
+  // por texto o por clase devolvia vacio.
 
-  // 3.5.a — salir de la pantalla de insercion de linea
-  const salir = fp.locator('button, [role="button"], a').filter({ hasText: /^\s*(salir|cerrar|cancelar|close|exit)\s*$/i }).last();
+  // 3.5.a — salir de la pantalla de insercion de linea (la guia lo pide)
+  const salir = fp.locator('button, [role="button"], a')
+    .filter({ hasText: /^\s*(salir|cerrar|cancelar|close|exit)\s*$/i }).last();
   if (await salir.count().catch(() => 0)) {
     await salir.click().catch(() => {});
     log('  Sali de la pantalla de insercion de linea');
   } else {
-    // Fallback: Escape suele cerrar el panel de linea sin tocar el booking
     await fp.keyboard.press('Escape').catch(() => {});
-    log('  ⚠ No encontre boton de salida — probe con Escape (ver captura 16)');
+    log('  No encontre boton de salida — probe con Escape (ver captura 16)');
   }
   await esperarApp(fp); await sleep(900);
 
-  // 3.5.b — tercera seccion del menu: Itinerario
-  const itinerario = fp.getByText(/^\s*itinerari[oa]\s*$/i).first();
-  if (!(await itinerario.count().catch(() => 0))) {
-    await captura(fp, '16b_sin_itinerario'); await volcarElementos(fp, 'sin_itinerario');
-    throw new Error('No encontre la seccion "Itinerario" (paso 3.5.b). Ver captura 16b + JSON.');
-  }
-  await itinerario.click();
-  await esperarApp(fp); await sleep(1200);
-  await captura(fp, '17_itinerario'); await volcarElementos(fp, 'itinerario');
+  // 3.5.b — zoom 75%: la guia lo pide para que menu y botonera entren completos.
+  await fp.evaluate(() => { document.documentElement.style.zoom = '0.75'; }).catch(() => {});
+  await sleep(800);
 
-  // 3.5.c — "Insertar booking": la guia dice que es el ULTIMO boton de la seccion
-  let insertar = fp.getByRole('button', { name: /insertar\s+booking/i }).first();
-  if (!(await insertar.count().catch(() => 0))) {
-    insertar = fp.getByText(/insertar\s+booking/i).first();
+  // 3.5.c — MENU LATERAL: abrirlo, expandir ITINERARIO y entrar a INSERTAR BOOKING.
+  // Tras guardar, Tourplan colapsa el menu a una franja con la hamburguesa: los
+  // items no estan en el DOM hasta abrirlo.
+  await abrirMenuLateral(fp);
+  await sleep(900);
+
+  // ITINERARIO es una seccion plegable DENTRO del nav. Antes de cada accion se
+  // vuelve a pasar el mouse por el nav: si el puntero sale, el menu se cierra y
+  // la seccion desaparece a mitad de camino.
+  const nav = fp.locator('div.tpnav, [class*="tpnav"]').first();
+  let insertar = fp.getByText(/^\s*insertar\s+booking\s*$/i).first();
+  for (let intento = 1; intento <= 4 && !(await insertar.count().catch(() => 0)); intento++) {
+    await nav.hover({ timeout: 3000 }).catch(() => {});
+    await sleep(600);
+    const seccion = fp.getByText(/^\s*itinerari[oa]\s*$/i).first();
+    if (!(await seccion.count().catch(() => 0))) {
+      log('  ITINERARIO no visible (intento ' + intento + '/4) — el menu se cerro, reabro');
+      await abrirMenuLateral(fp);
+      continue;
+    }
+    // force:true evita que Playwright aborte por el chequeo de "estabilidad":
+    // el nav se esta animando y nunca queda quieto el tiempo que el pide.
+    await seccion.click({ timeout: 4000, force: true }).catch((e) =>
+      log('  Fallo el clic: ' + String(e.message).split('\n')[0].slice(0, 60)));
+    await fp.getByText(/^\s*insertar\s+booking\s*$/i).first()
+      .waitFor({ state: 'visible', timeout: 5000 }).catch(() => {});
+    insertar = fp.getByText(/^\s*insertar\s+booking\s*$/i).first();
+    if (await insertar.count().catch(() => 0)) { log('  Seccion ITINERARIO desplegada'); break; }
   }
+
+  await captura(fp, '17_menu_itinerario'); await volcarElementos(fp, 'menu_itinerario');
   if (!(await insertar.count().catch(() => 0))) {
-    await volcarElementos(fp, 'itinerario_sin_boton');
-    throw new Error('No encontre "Insertar booking" dentro de Itinerario (paso 3.5.c). Ver JSON itinerario_sin_boton.');
+    // Volcado del DOM REAL de la franja del menu: el volcado normal solo mira
+    // el panel principal y por eso nunca mostro estos elementos.
+    const menu = await fp.evaluate(() => {
+      const out = [];
+      document.querySelectorAll('*').forEach((e) => {
+        const r = e.getBoundingClientRect();
+        if (r.width === 0 || r.height === 0 || r.left > 300 || r.width > 320) return;
+        const txt = (e.childElementCount === 0 ? (e.textContent || '') : '').trim();
+        out.push({
+          tag: e.tagName.toLowerCase(),
+          clase: (e.className && e.className.baseVal !== undefined ? e.className.baseVal : e.className || '').toString().slice(0, 80),
+          texto: txt.slice(0, 34),
+          hijos: e.childElementCount,
+          x: Math.round(r.left), y: Math.round(r.top), w: Math.round(r.width), h: Math.round(r.height),
+        });
+      });
+      return out.slice(0, 60);
+    }).catch(() => []);
+    log('  --- DOM del menu lateral (para ajustar el selector) ---');
+    for (const m of menu) {
+      log('    ' + m.tag.padEnd(7) + ' [' + m.clase + '] "' + m.texto + '" hijos=' + m.hijos + ' @' + m.x + ',' + m.y + ' ' + m.w + 'x' + m.h);
+    }
+    throw new Error('No encontre "INSERTAR BOOKING" en el menu lateral, seccion Itinerario (paso 3.5.c). Ver el volcado de arriba.');
   }
   await insertar.click();
-  await esperarApp(fp); await sleep(1200);
-  await captura(fp, '17b_buscador_file');
-
-  // 3.5.d — pegar el codigo EXACTO del file que salio de la consulta SQL
-  const buscador = fp.locator('input[type="text"]:visible, input[type="search"]:visible').last();
-  if (!(await buscador.count().catch(() => 0))) {
-    await volcarElementos(fp, 'buscador_file');
-    throw new Error('No encontre el campo de busqueda del file (paso 3.5.d). Ver JSON buscador_file.');
-  }
-  await tipear(fp, buscador, CFG.fileOrigen);
-  await fp.keyboard.press('Enter').catch(() => {});
   await esperarApp(fp); await sleep(1600);
-  await captura(fp, '17c_resultados'); await volcarElementos(fp, 'resultados_file');
+  await captura(fp, '17b_seleccionar_booking'); await volcarElementos(fp, 'seleccionar_booking');
 
-  // 3.5.e — primera opcion, verificando que sea la coincidencia EXACTA.
-  // La guia insiste en "verificando que sea la coincidencia exacta": clonar el
-  // file equivocado le arma al pasajero un viaje que no pidio, y eso no se nota
-  // hasta que alguien lee la cotizacion. Mejor abortar que clonar cualquier cosa.
-  const fila = fp.locator(`tr:has-text("${CFG.fileOrigen}"), li:has-text("${CFG.fileOrigen}"), [role="row"]:has-text("${CFG.fileOrigen}")`).first();
-  if (!(await fila.count().catch(() => 0))) {
-    throw new Error(`La busqueda no devolvio el file ${CFG.fileOrigen} (paso 3.5.e). Ver captura 17c.`);
+  // 3.5.d — pantalla "SELECCIONAR BOOKING A INSERTAR".
+  // Tiene DOS buscadores: NOMBRE y REFERENCIA. El codigo del file va en
+  // REFERENCIA. Antes se tecleaba "en el input que estuviera enfocado" y
+  // terminaba escribiendose en NOMBRE, que busca por pasajero y no devuelve nada.
+  const codigo = String(CFG.fileOrigen);
+
+  // El modal "Insertar Booking" repite las MISMAS clases que la cabecera del
+  // booking recien creado: hay dos inputs tpdescription-bookingfullreference en
+  // la pagina. El de la cabecera es la referencia del file nuevo; el del modal
+  // es el que hay que llenar. Como el modal se dibuja despues, es el ULTIMO.
+  // Buscar por la etiqueta "Referencia" agarraba el de arriba, y el codigo
+  // terminaba escrito en NOMBRE.
+  const refInput = fp.locator('input[class*="bookingfullreference" i]').last();
+  if (!(await refInput.count().catch(() => 0))) {
+    throw new Error('No encontre el campo REFERENCIA del modal Insertar Booking (paso 3.5.d). Ver JSON seleccionar_booking.');
   }
-  await fila.click();
-  await esperarApp(fp); await sleep(1500);
-  await captura(fp, '17d_file_seleccionado');
-  log(`FASE 3.5 OK — servicios del file ${CFG.fileOrigen} insertados`);
+
+  // Se teclea y se sale con Tab. NO se toca la lupa "Buscar Bookings": abre otro
+  // modal de filtros donde lo tecleado cae en "Nombre inicia con" (busca por
+  // nombre de pasajero) y el file no aparece nunca.
+  await refInput.click().catch(() => {});
+  await refInput.fill('').catch(() => {});
+  await fp.keyboard.type(codigo, { delay: 60 });
+  await fp.keyboard.press('Tab').catch(() => {});
+  await esperarApp(fp); await sleep(2000);
+  await captura(fp, '17c_referencia'); await volcarElementos(fp, 'referencia');
+
+  // 3.5.e — verificar que Tourplan resolvio la referencia a un booking real.
+  // Si no resuelve, el campo NOMBRE del modal queda vacio y Guardar deshabilitado.
+  const nombreModal = fp.locator('input[class*="bookingname" i]').last();
+  const nombreResuelto = await nombreModal.inputValue().catch(() => '');
+  const refFinal = await refInput.inputValue().catch(() => '');
+  log('  REFERENCIA = "' + refFinal + '"  |  NOMBRE resuelto = "' + nombreResuelto + '"');
+
+  if (!String(refFinal).toUpperCase().includes(codigo.toUpperCase())) {
+    throw new Error('La referencia no quedo escrita en el modal (quedo "' + refFinal + '"). Ver captura 17c.');
+  }
+  if (!nombreResuelto.trim()) {
+    // Puede que necesite la lista: se abre la lupa de REFERENCIA y se elige.
+    log('  La referencia no resolvio sola — abro la lupa de REFERENCIA');
+    const lupaRef = fp.locator('button[class*="tplookupbooking" i]').last();
+    if (await lupaRef.count().catch(() => 0)) {
+      await lupaRef.click().catch(() => {});
+      await esperarApp(fp); await sleep(2500);
+      await captura(fp, '17d_lupa'); await volcarElementos(fp, 'lupa_referencia');
+      const fila = fp.locator(
+        'tr:has-text("' + codigo + '"), [role="row"]:has-text("' + codigo + '"), li:has-text("' + codigo + '")'
+      ).first();
+      if (await fila.count().catch(() => 0)) {
+        await fila.dblclick().catch(async () => { await fila.click().catch(() => {}); });
+        await esperarApp(fp); await sleep(1800);
+      }
+    }
+  }
+  await captura(fp, '17e_referencia_resuelta');
+
+  // 3.5.f — INSERTAR TIPO debe quedar en "Insertar", nunca en "Mezclar":
+  // Mezclar pisa los servicios existentes en vez de agregarlos. Viene marcado
+  // asi por defecto (es el primer radio), pero se fuerza por las dudas.
+  // El radio "Insertar" ya viene marcado por defecto (el volcado lo muestra con
+  // el atributo checked). Solo se fuerza si por algun motivo no lo estuviera:
+  // clickearlo a ciegas puede caer en "Mezclar", que pisa los servicios.
+  log('  INSERTAR TIPO = Insertar: ' + (await marcarOpcion(fp, 'Insertar')));
+
+  // "Insertar en Dia/Sec" viene VACIO. El booking nuevo no tiene ninguna linea,
+  // asi que los servicios clonados van al dia 1, secuencia 1. Sin esto Tourplan
+  // acepta el guardado pero el itinerario queda sin lineas.
+  const dia = fp.locator('input[class*="tpnumber-detailsday" i]').last();
+  const sec = fp.locator('input[class*="tpnumber-servicesequence" i]').last();
+  for (const [campo, valor, nombre] of [[dia, '1', 'Dia'], [sec, '1', 'Sec']]) {
+    if (!(await campo.count().catch(() => 0))) { log('  ⚠ No encontre el campo ' + nombre); continue; }
+    await campo.click({ timeout: 5000 }).catch(() => {});
+    await fp.keyboard.press('Control+a').catch(() => {});
+    await fp.keyboard.type(valor, { delay: 40 });
+    await fp.keyboard.press('Tab').catch(() => {});
+  }
+  log('  Insertar en Dia/Sec = "' + (await dia.inputValue().catch(() => '?')) +
+      '" / "' + (await sec.inputValue().catch(() => '?')) + '"');
+  await sleep(400);
+  await captura(fp, '17e_parametros');
+
+  // 3.5.g — confirmar la insercion
+  // En este modal el boton de confirmar es GUARDAR (arriba a la derecha), y
+  // queda deshabilitado hasta que la referencia resuelve a un booking real.
+  // El confirmar del modal es button.tpsave ("Guardar"), arriba a la derecha.
+  // Queda deshabilitado hasta que la referencia resuelve a un booking real.
+  let confirmar = fp.locator('button[class*="tpsave" i]').last();
+  if (!(await confirmar.count().catch(() => 0))) {
+    confirmar = fp.getByRole('button', { name: /^\s*(guardar|insertar|aceptar|ok|confirmar)\s*$/i }).last();
+  }
+  if (await confirmar.count().catch(() => 0)) {
+    await confirmar.click();
+    log('  Confirme la insercion');
+  } else {
+    await fp.keyboard.press('Enter').catch(() => {});
+    log('  No encontre boton de confirmar — probe con Enter (ver captura 17e)');
+  }
+  await esperarApp(fp); await sleep(2000);
+
+  // Al guardar, Tourplan abre el dialogo "Recalcular Booking" y NO inserta nada
+  // hasta que se confirma. Trae marcada "Reemplazar todos MENOS modificaciones
+  // manuales"; la guia V4 exige "Reemplazar todos" a secas. Se elige por DOM
+  // porque los dos rotulos empiezan igual y un selector por texto casa con
+  // ambos, y porque el modal de atras tambien tiene radios (Insertar/Mezclar).
+  const dialogo = fp.getByText(/recalcular\s+booking/i).first();
+  if (await dialogo.count().catch(() => 0)) {
+    await captura(fp, '17f_recalcular');
+    await volcarElementos(fp, 'recalcular');
+    // Tourplan no dibuja radios nativos aca: son cuadraditos propios a la
+    // izquierda de cada rotulo. Buscar input[type=radio] devolvia "sin radio" y
+    // quedaba marcada la opcion por defecto ("...menos modificaciones
+    // manuales"), que no es la que pide la guia. Se ubica el control por
+    // geometria: el elemento chico mas pegado al rotulo, a su izquierda y a la
+    // misma altura.
+    const marcado = await marcarOpcion(fp, 'Reemplazar Todos');
+    log('  "Reemplazar todos": ' + marcado);
+    await sleep(800);
+    await captura(fp, '17f2_recalcular_elegido');
+
+    const si = fp.getByRole('button', { name: /^\s*s[ií]\s*$/i }).first();
+    if (await si.count().catch(() => 0)) {
+      await si.click({ timeout: 8000 }).catch((e) => log('  No pude clickear SI: ' + String(e.message).slice(0, 60)));
+      log('  Confirme el recalculo con "Si"');
+    } else {
+      log('  No encontre el boton "Si" del dialogo Recalcular');
+    }
+    // Tourplan muestra "GUARDANDO DATOS ..." y la insercion tarda varios
+    // segundos. Si se sigue de largo, la validacion corre con el modal todavia
+    // arriba y termina contando las filas del modal como si fueran servicios.
+    await fp.getByText(/guardando\s+datos/i).first()
+      .waitFor({ state: 'hidden', timeout: 90000 })
+      .then(() => log('  Guardado terminado'))
+      .catch(() => log('  El cartel "Guardando datos" no desaparecio en 90s'));
+    await captura(fp, '17f3_tras_recalculo'); await volcarElementos(fp, 'tras_recalculo');
+
+    // ORDEN IMPORTANTE. El modal "Insertar Booking" no se cierra solo porque
+    // Tourplan esta esperando que se coticen a mano los servicios que no tienen
+    // tarifa para la fecha nueva. Si se le da SALIR ahi, se cancela la
+    // insercion: el panel de tarifas igual aparece, se deja guardar sin
+    // protestar, y el itinerario termina vacio. Primero las tarifas.
+    await fp.getByText(ROTULO_TARIFA_MANUAL).first()
+      .waitFor({ state: 'visible', timeout: 20000 })
+      .then(() => log('  Tourplan pide tarifas manuales antes de cerrar el modal'))
+      .catch(() => log('  Todavia no pidio tarifas manuales'));
+    await faseTarifasManuales(fp);
+
+    // Recien ahora, si el modal quedo abierto, se sale.
+    let sigueAbierto = await fp.getByText(/seleccionar\s+booking\s+a\s+insertar/i)
+      .first().isVisible().catch(() => false);
+    if (sigueAbierto) {
+      const salirModal = fp.locator('button[class*="tpcancel" i]').last();
+      if (await salirModal.count().catch(() => 0)) {
+        await salirModal.click({ timeout: 8000 }).catch(() => {});
+        log('  Cerre el modal con SALIR (ya cotizado)');
+      }
+      await esperarApp(fp); await sleep(2500);
+      sigueAbierto = await fp.getByText(/seleccionar\s+booking\s+a\s+insertar/i)
+        .first().isVisible().catch(() => false);
+    } else {
+      log('  El modal Insertar Booking se cerro solo');
+    }
+    log(sigueAbierto ? '  El modal Insertar Booking sigue abierto' : '  El modal Insertar Booking se cerro');
+    await esperarApp(fp); await sleep(2000);
+  }
+
+  await captura(fp, '17g_insertado'); await volcarElementos(fp, 'post_insercion');
+
+  // Los servicios sin tarifa vigente abren un modal pidiendola a mano. Hay que
+  // despacharlos aca: si no, tapan el itinerario y el resto del proceso mide
+  // el modal en vez del booking.
+  await faseTarifasManuales(fp);
+
+  log('FASE 3.5 OK — servicios del file ' + CFG.fileOrigen + ' insertados');
+}
+
+/**
+ * Devuelve el <input> de una etiqueta de Tourplan.
+ * Tourplan no usa <label for>: arma filas etiqueta + control, asi que hay que
+ * probar varias vias antes de rendirse.
+ */
+async function inputDeCampo(fp, textoEtiqueta, clases) {
+  clases = clases || [];
+  const porLabel = fp.getByLabel(textoEtiqueta).first();
+  if (await porLabel.count().catch(() => 0)) return porLabel;
+  for (const c of clases) {
+    const porClase = fp.locator('input[class*="' + c + '" i]').first();
+    if (await porClase.count().catch(() => 0)) return porClase;
+  }
+  const fila = fp.locator('div,tr,li').filter({ hasText: textoEtiqueta }).last();
+  if (await fila.count().catch(() => 0)) {
+    const dentro = fila.locator('input:visible').first();
+    if (await dentro.count().catch(() => 0)) return dentro;
+  }
+  return null;
+}
+
+/**
+ * Modal "Servicio requiere ingr. manual de tarifas".
+ *
+ * Aparece DESPUES de cerrar "Insertar Booking": los servicios clonados que no
+ * tienen tarifa vigente para la fecha nueva no se pueden costear solos y
+ * Tourplan pide la tarifa a mano, un servicio por vez. Mientras el modal este
+ * arriba no se ve el itinerario, asi que todo lo que venga despues (3.6, 3.7)
+ * mide el modal y no el booking.
+ *
+ * La guia V4 (paso 3.6) dice que los precios quedan en el valor indicativo
+ * "999" justamente para que el vendedor sepa que hay que ajustarlos a mano:
+ * eso es lo que se carga aca.
+ */
+// OJO: este patron tambien vive DUPLICADO dentro de un page.evaluate() en
+// faseValidarLineas (el navegador no puede ver closures de Node) — si se
+// ensancha aca, ensanchar tambien alla.
+const ROTULO_TARIFA_MANUAL = /(requiere\s+ingr\.?\s*manual\s+de\s+tarifas|extensi[oó]n\s+tarifa\s+(expirada|vencida)|tarifa\s+no\s+vigente)/i;
+
+async function modalTarifasVisible(fp) {
+  return await fp.getByText(ROTULO_TARIFA_MANUAL).first().isVisible().catch(() => false);
+}
+
+async function faseTarifasManuales(fp) {
+  if (!(await modalTarifasVisible(fp))) {
+    log('  No quedaron servicios pidiendo tarifa manual');
+    return;
+  }
+  await captura(fp, '17h_tarifa_manual'); await volcarElementos(fp, 'tarifa_manual');
+
+  let anterior = null;
+  for (let vuelta = 1; vuelta <= 20; vuelta++) {
+    if (!(await modalTarifasVisible(fp))) {
+      log('  Tarifas manuales resueltas (' + (vuelta - 1) + ' servicio/s)');
+      return;
+    }
+
+    // Que servicio esta pidiendo tarifa: sirve para el log y para detectar que
+    // el modal se quedo trabado en el mismo (Guardar no lo esta cerrando).
+    const cual = await fp.evaluate(() => {
+      const hojas = [...document.querySelectorAll('*')].filter((e) => e.childElementCount === 0);
+      const n = hojas.find((e) => /\d{3}\s*\/\s*\w+\s*\/\s*\d+\s*\/\s*\w+/.test((e.textContent || '').trim()));
+      return n ? (n.textContent || '').replace(/\s+/g, ' ').trim().slice(0, 40) : '';
+    }).catch(() => '');
+
+    // Solo tpnumber-costamount es editable; tpnumber-default viene tpreadonly.
+    const campos = fp.locator('input[class*="tpnumber-costamount" i]');
+    const n = await campos.count().catch(() => 0);
+    let puestos = 0;
+    for (let i = 0; i < n; i++) {
+      const c = campos.nth(i);
+      if (!(await c.isVisible().catch(() => false))) continue;
+      // fill() no dispara el change detection de Angular en Tourplan: se teclea.
+      await c.click({ timeout: 5000 }).catch(() => {});
+      await fp.keyboard.press('Control+a').catch(() => {});
+      await fp.keyboard.type('999', { delay: 30 });
+      await fp.keyboard.press('Tab').catch(() => {});
+      puestos++;
+    }
+    log('  Tarifa manual ' + vuelta + ' [' + (cual || 'servicio ?') + ']: ' + puestos + ' campo(s) en 999');
+    await captura(fp, '17h2_tarifa_cargada_' + vuelta);
+
+    // "Guardar Todo" cierra el servicio completo (todos sus componentes).
+    let guardar = fp.locator('button[class*="tpsaveall" i]').last();
+    if (!(await guardar.count().catch(() => 0))) guardar = fp.locator('button[class*="tpsave" i]').last();
+    if (await guardar.count().catch(() => 0)) {
+      await guardar.click({ timeout: 8000 }).catch((e) =>
+        log('  No pude clickear Guardar del modal de tarifas: ' + String(e.message).split('\n')[0].slice(0, 60)));
+    } else {
+      log('  ⚠ No encontre el boton Guardar del modal de tarifas');
+      break;
+    }
+    await esperarApp(fp); await sleep(2500);
+    await fp.getByText(/guardando\s+datos/i).first()
+      .waitFor({ state: 'hidden', timeout: 60000 }).catch(() => {});
+    // El itinerario quedaba vacio y no se sabia en que momento: se fotografia
+    // la pantalla inmediatamente despues de guardar cada tarifa.
+    await captura(fp, '17i_tras_guardar_tarifa_' + vuelta);
+    await volcarElementos(fp, 'tras_guardar_tarifa_' + vuelta);
+
+    if (cual && cual === anterior) {
+      await captura(fp, '17h_tarifa_trabada');
+      throw new Error('El modal de tarifas manuales se trabo en el servicio ' + cual +
+        ': Guardar no lo cierra (paso 3.5). Ver captura 17h_tarifa_trabada.');
+    }
+    anterior = cual;
+  }
+
+  if (await modalTarifasVisible(fp)) {
+    await captura(fp, '17h_tarifa_trabada');
+    throw new Error('Quedaron servicios pidiendo tarifa manual despues de 20 vueltas (paso 3.5).');
+  }
 }
 
 /**
@@ -585,12 +1067,64 @@ async function faseValidarLineas(fp) {
     return malas;
   }).catch(() => []);
 
+  // Antes esto cantaba exito con la tabla vacia: solo miraba si habia filas
+  // rojas, y cero filas tambien es "cero rojas". Si el clon no inserto nada,
+  // hay que enterarse aca y no dos pasos mas adelante.
+  const lineas = await fp.evaluate(() => {
+    // Solo la grilla del itinerario. Antes se contaba cualquier <tr> de la
+    // pagina y las filas del modal ("Doble", "Adulto 01") pasaban por servicios.
+    // Cualquiera de los dos modales tapa el itinerario: contar filas con uno
+    // arriba fue exactamente el falso positivo de las corridas anteriores.
+    const modalArriba = [...document.querySelectorAll('*')].some((e) =>
+      e.childElementCount === 0 &&
+      /(seleccionar\s+booking\s+a\s+insertar|requiere\s+ingr\.?\s*manual\s+de\s+tarifas|extensi[oó]n\s+tarifa\s+(expirada|vencida)|tarifa\s+no\s+vigente)/i
+        .test(e.textContent || ''));
+    if (modalArriba) return -1;
+    const filas = [...document.querySelectorAll('tbody tr, [role="rowgroup"] [role="row"]')];
+    return filas.filter((f) => {
+      const celdas = f.querySelectorAll('td, [role="cell"]');
+      return celdas.length >= 3 && (f.textContent || '').trim().length > 8;
+    }).length;
+  }).catch(() => 0);
+  if (lineas === -1) {
+    throw new Error('Habia un modal abierto al validar (Insertar Booking o tarifas manuales): la insercion no termino (paso 3.7). Ver captura 17e_validacion_color.');
+  }
+  log('  Lineas de servicio en el itinerario: ' + lineas);
+
+  let lineasFinal = lineas;
+  if (!lineas) {
+    // Antes de acusar a la insercion: la grilla de Tourplan no siempre se
+    // repinta sola despues de guardar. Las flechas de la barra de pax fuerzan
+    // un re-render sin tocar los datos.
+    log('  Grilla vacia — fuerzo un refresco con las flechas de la barra de pax');
+    const der = fp.locator('button[class*="tpbutton-navright" i]').first();
+    const izq = fp.locator('button[class*="tpbutton-navleft" i]').first();
+    if (await der.count().catch(() => 0)) { await der.click({ timeout: 5000, force: true }).catch(() => {}); await esperarApp(fp); await sleep(1500); }
+    if (await izq.count().catch(() => 0)) { await izq.click({ timeout: 5000, force: true }).catch(() => {}); await esperarApp(fp); await sleep(1500); }
+    await captura(fp, '17e2_tras_refresco'); await volcarElementos(fp, 'tras_refresco');
+
+    lineasFinal = await fp.evaluate(() => {
+      const filas = [...document.querySelectorAll('tbody tr, [role="rowgroup"] [role="row"]')];
+      return filas.filter((f) => {
+        const celdas = f.querySelectorAll('td, [role="cell"]');
+        return celdas.length >= 3 && (f.textContent || '').trim().length > 8;
+      }).length;
+    }).catch(() => 0);
+    log('  Lineas despues del refresco: ' + lineasFinal);
+  }
+
+  if (!lineasFinal) {
+    throw new Error('El itinerario quedo VACIO incluso tras refrescar: la insercion del file ' +
+      CFG.fileOrigen + ' no dejo lineas (paso 3.7). Ver capturas 17h2 / 17i / 17e2.');
+  }
+  const lineasOk = lineasFinal;
+
   if (rojas.length) {
     log(`  ⚠ ${rojas.length} servicio(s) en ROJO — no operan en la fecha elegida`);
     rojas.slice(0, 3).forEach(r => log(`     · ${r}`));
     throw Object.assign(new Error('DISPONIBILIDAD (lineas rojas): ' + rojas.slice(0, 2).join(' | ')), { estacional: true });
   }
-  log('FASE 3.7 OK — todas las lineas blancas, el file se inserto correctamente');
+  log('FASE 3.7 OK — ' + lineasOk + ' lineas, todas blancas: el file se inserto correctamente');
 }
 
 /**
@@ -598,27 +1132,38 @@ async function faseValidarLineas(fp) {
  * disponibilidad, se ocultan las fechas para poder mandar igual la cotizacion.
  */
 async function faseOcultarFechas(fp) {
+  // "Ocultar fechas" vive en la misma pantalla que "Mostrar precios"
+  // (Detalles de booking -> Configuracion general) y es el mismo tipo de campo:
+  // un campo-lista de Tourplan, no un <select>.
   await fp.evaluate(() => { document.documentElement.style.zoom = '0.75'; }).catch(() => {});
-  const analisis = fp.getByText(/^\s*An[aá]lisis\s*$/i).first();
-  if (await analisis.count().catch(() => 0)) { await analisis.click(); await sleep(1000); }
-  const ocultar = fp.getByLabel(/ocultar\s+fechas/i).first();
-  if (await ocultar.count().catch(() => 0)) {
-    await ocultar.selectOption({ label: 'SI' }).catch(async () => { await ocultar.click().catch(() => {}); });
-    log('  "Ocultar Fechas" → SI');
+  const entro = await abrirItemMenu(
+    fp,
+    /^\s*detalles\s+de\s+booking\s*$/i,
+    /^\s*configuraci[oó]n\s+general\s*$/i,
+    'Configuracion general'
+  );
+  if (entro) {
+    const ok = await seleccionarEnLista(fp, 'Ocultar fechas', '1');
+    log(ok ? '  "Ocultar fechas" -> 1 - SI ok' : '  ! No pude dejar "Ocultar fechas" en SI');
   } else {
-    const txt = fp.getByText(/ocultar\s+fechas/i).first();
-    if (await txt.count().catch(() => 0)) { await txt.click().catch(() => {}); log('  "Ocultar Fechas" clickeado (verificar captura)'); }
-    else log('  ⚠ No encontre "Ocultar Fechas" — ver JSON');
+    log('  ! No pude llegar a Configuracion general para ocultar fechas');
   }
   await fp.evaluate(() => { document.documentElement.style.zoom = '1'; }).catch(() => {});
-  await captura(fp, '19b_ocultar_fechas'); await volcarElementos(fp, 'ocultar_fechas');
+  await captura(fp, '19c_ocultar_fechas'); await volcarElementos(fp, 'ocultar_fechas');
 }
 
 async function faseReemplazarPrecios(fp) {
   // Al insertar, pregunta por precios → SIEMPRE "Reemplazar todos"
-  const reemplazar = fp.getByText(/reemplazar\s+todos/i).first();
-  if (await reemplazar.count()) { await reemplazar.click(); log('  "Reemplazar todos" clickeado'); }
-  else log('  ⚠ No aparecio el dialogo "Reemplazar todos" (puede venir despues) — capturando');
+  // El dialogo normalmente ya se resolvio en el paso 3.5 (aparece al Guardar).
+  // Esto queda como red por si Tourplan lo muestra mas tarde. Con timeout: sin
+  // el, un click sobre algo no clickeable colgaba la corrida 30 segundos.
+  const reemplazar = fp.getByText(/^\s*reemplazar\s+todos\s*$/i).first();
+  if (await reemplazar.count().catch(() => 0)) {
+    await reemplazar.click({ timeout: 5000, force: true })
+      .then(() => log('  "Reemplazar todos" clickeado (dialogo tardio)'))
+      .catch(() => log('  "Reemplazar todos" visible pero no clickeable — sigo'));
+  }
+  else log('  El recalculo ya se confirmo en el paso 3.5 — nada que hacer aca');
   await esperarApp(fp); await sleep(1500);
   await captura(fp, '18_precios'); await volcarElementos(fp, 'precios');
   // Deteccion de disponibilidad (estacionalidad) SOLO en alertas/dialogos visibles,
@@ -640,27 +1185,53 @@ async function faseReemplazarPrecios(fp) {
 }
 
 async function faseOcultarPrecios(fp) {
-  // Zoom 75% (la guia lo exige para ver todos los controles)
+  // Zoom 75%: la guia lo exige para que entren todos los controles en pantalla.
   await fp.evaluate(() => { document.documentElement.style.zoom = '0.75'; }).catch(() => {});
-  // Configuracion general → seccion "Analisis" → "Mostrar precios" = No
-  const analisis = fp.getByText(/^\s*An[aá]lisis\s*$/i).first();
-  if (await analisis.count()) { await analisis.click(); await sleep(1000); }
+
+  // "Mostrar precios" no esta en el itinerario: cuelga de DETALLES DE BOOKING ->
+  // Configuracion general.
+  const entro = await abrirItemMenu(
+    fp,
+    /^\s*detalles\s+de\s+booking\s*$/i,
+    /^\s*configuraci[oó]n\s+general\s*$/i,
+    'Configuracion general'
+  );
   await captura(fp, '19_analisis'); await volcarElementos(fp, 'analisis');
-  const mostrar = fp.getByText(/mostrar\s+precios/i).first();
-  if (await mostrar.count()) {
-    // El control puede ser select o toggle — intento select "No", si no toggle click
-    const sel = fp.getByLabel(/mostrar\s+precios/i).first();
-    if (await sel.count().catch(() => 0)) await sel.selectOption({ label: 'No' }).catch(() => {});
-    else await mostrar.click().catch(() => {});
-    log('  "Mostrar precios" → No (verificar captura 19)');
-  } else log('  ⚠ No encontre "Mostrar precios" — ver JSON 19');
+  if (!entro) {
+    log('  ! No pude llegar a Configuracion general — el booking queda CON precios visibles');
+    await fp.evaluate(() => { document.documentElement.style.zoom = '1'; }).catch(() => {});
+    log('FASE 3.6b incompleta (revisar captura 19)');
+    return;
+  }
+
+  // Es un campo-lista de Tourplan (input con dropdown propio), no un <select>:
+  // por eso selectOption no encontraba ninguna opcion. Se reutiliza el helper
+  // que ya resuelve AGENCIA / MONEDA / DIVISION. Codigo "2" = NO.
+  const ok = await seleccionarEnLista(fp, 'Mostrar precios', '2');
+  log(ok ? '  "Mostrar precios" -> 2 - NO ok'
+         : '  ! No pude dejar "Mostrar precios" en NO — la cotizacion saldria CON precios');
+
   await fp.evaluate(() => { document.documentElement.style.zoom = '1'; }).catch(() => {});
+  await captura(fp, '19b_mostrar_precios');
   log('FASE 3.6b hecha');
 }
 
 async function faseGuardarYCerrar(fp, page, refAntes) {
-  const guardar = fp.getByRole('button', { name: /guardar|save/i }).first();
-  if (await guardar.count()) { await guardar.click(); await esperarApp(fp); await sleep(1200); await cerrarModalSiAparece(fp); }
+  // Sin timeout, este click colgaba 30 segundos: getByRole enganchaba el primer
+  // boton que dijera "guardar" aunque estuviera tapado. Se prioriza el tpsave de
+  // la pantalla (y se excluye tpsaveall, que es otro boton).
+  let guardar = fp.locator('button[class*="tpsave" i]:not([class*="tpsaveall" i])').last();
+  if (!(await guardar.count().catch(() => 0))) {
+    guardar = fp.getByRole('button', { name: /^\s*guardar\s*$/i }).last();
+  }
+  if (await guardar.count().catch(() => 0)) {
+    await guardar.click({ timeout: 10000, force: true })
+      .then(() => log('  Cambios guardados'))
+      .catch((e) => log('  ! No pude clickear Guardar: ' + String(e.message).split('\n')[0].slice(0, 60)));
+    await esperarApp(fp); await sleep(1500); await cerrarModalSiAparece(fp);
+  } else {
+    log('  ! No encontre el boton Guardar final');
+  }
   const refDespues = await capturarReferencia(fp);
   if (refAntes && refDespues && refAntes === refDespues) log('  Referencia verificada: ' + refDespues);
   await captura(fp, '20_final');
