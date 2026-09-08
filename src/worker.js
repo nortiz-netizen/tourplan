@@ -109,8 +109,16 @@ function guardarResultado(leadId, resultado) {
   if (resultado.referencia)     sets.push(`Referencia_Tourplan__c='${esc(resultado.referencia)}'`);
   if (resultado.linkItinerario) sets.push(`Link_Itinerario__c='${esc(resultado.linkItinerario)}'`);
   sets.push('Fecha_Clonacion__c=Datetime.now()');
-  if (resultado.motivo) {
-    sets.push(`Log_Clonacion__c='${esc(String(resultado.motivo).replace(/\s+/g, ' ').trim().slice(0, 480))}'`);
+  // backendMotivo viaja junto con motivo: cuando la clonacion sale OK pero el backend
+  // no devuelve el link, el unico rastro del fallo quedaba en resultado.json, que vive
+  // en el EC2. En Salesforce el Lead quedaba en OK, con el link vacio y sin ninguna
+  // explicacion — que es exactamente como este problema estuvo pasando desapercibido.
+  const motivos = [
+    resultado.motivo || null,
+    resultado.backendMotivo ? `BACKEND: ${resultado.backendMotivo}` : null,
+  ].filter(Boolean).join(' | ');
+  if (motivos) {
+    sets.push(`Log_Clonacion__c='${esc(motivos.replace(/\s+/g, ' ').trim().slice(0, 480))}'`);
   }
   const apex = `update new Lead(Id='${leadId}', ${sets.join(', ')});`;
   const tmp = '.writeback.apex';
