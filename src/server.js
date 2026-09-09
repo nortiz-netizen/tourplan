@@ -19,7 +19,9 @@ import express from 'express';
 import { spawn } from 'node:child_process';
 import fs from 'node:fs';
 import dotenv from 'dotenv';
+import { chromium } from 'playwright';
 import { leadATourplan } from './mapeo.js';
+import { generarLink } from './backend.js';
 dotenv.config();
 
 const PORT  = parseInt(process.env.SCRAPER_PORT || '3000', 10);
@@ -59,6 +61,47 @@ app.get('/resultados', (req, res) => {
 
 app.get('/estado', (req, res) => {
   res.json({ ok: true, enCola: cola.length, procesando, resultadosListos: resultados.length });
+});
+
+/**
+ * POST /link  body = { referencia, site?, idioma? }  -> { estado, link?, motivo? }
+ *
+ * Reintento del paso 4 para una reserva YA clonada. Existe porque el backend de
+ * Say Hueque no publica las reservas al instante: clonar.js pide el link tres
+ * segundos despues de crearla y ahi todavia no esta, asi que el Lead queda con la
+ * referencia y sin link para siempre. Con esto Salesforce puede volver a pedirlo
+ * mas tarde, en su ciclo, hasta que el backend la publique.
+ *
+ * Se respeta el modelo del server: el scraper NO toca Salesforce. Solo abre el
+ * navegador, consulta el backend y devuelve lo que encontro; quien guarda es Apex.
+ */
+app.post('/link', async (req, res) => {
+  const { referencia, site, idioma } = req.body || {};
+  if (!referencia) return res.status(400).json({ error: 'falta la referencia' });
+
+  // No se pisa una corrida del robot: Tourplan es single-session y el backend usa
+  // el mismo navegador. Si esta clonando, que Salesforce reintente en el proximo ciclo.
+  if (procesando) return res.json({ estado: 'OCUPADO', motivo: 'El robot esta clonando; reintentar en el proximo ciclo' });
+
+  let browser;
+  try {
+    browser = await chromium.launch({
+      headless: /^(true|1|si)$/i.test(process.env.TP_HEADLESS || ''),
+      args: ['--no-sandbox', '--disable-dev-shm-usage'],
+    });
+    const r = await generarLink(browser, {
+      referencia,
+      site: site || 'sayhueque',
+      idioma: idioma || 'EN',
+    });
+    log(`  /link ${referencia} -> ${r.estado}${r.link ? ' / ' + r.link : ''}`);
+    res.json(r);
+  } catch (e) {
+    log(`  /link ${referencia} -> ERROR ${String(e.message).split('\n')[0]}`);
+    res.json({ estado: 'ERROR', motivo: String(e.message).split('\n')[0] });
+  } finally {
+    if (browser) await browser.close().catch(() => {});
+  }
 });
 
 async function procesarCola() {

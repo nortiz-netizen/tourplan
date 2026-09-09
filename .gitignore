@@ -8,3 +8,17 @@ datos-entrada.json
 *.soql
 .soql-tmp.soql
 _*.apex
+
+# Copias de .env hechas a mano en el servidor: llevan credenciales de Tourplan.
+# El patron .env de arriba NO las tapa (.env.antes-v4, .env.bak.NNN).
+.env.*
+
+# Respaldos y bitacoras de las pruebas en el servidor.
+*.bak
+*.bak-*
+src/*.antes-*
+src/*.respaldo-*
+src/*.v4-OK
+prueba*.log
+prueba*.json
+server.log

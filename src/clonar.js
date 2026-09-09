@@ -1390,7 +1390,15 @@ async function main() {
     fs.writeFileSync('resultado.json', JSON.stringify({
       // Si el booking ya se habia guardado (falla despues, ej. paso 3.5), igual
       // dejamos la referencia para no perder la reserva creada en Tourplan.
-      leadId: CFG.leadId, estado: 'ERROR', referencia: ultimaRef, motivo: e.message.split('\n')[0],
+        /* Un fallo de DISPONIBILIDAD no es un error tecnico: es el desenlace que
+           preve la guia V4 cuando el ultimo intento sigue con lineas rojas.
+           Marcarlo como ERROR hacia que Salesforce lo tratara como falla del robot
+           y el pasajero NO recibiera el mensaje Taylor Made: se quedaba esperando
+           una cotizacion que nunca iba a llegar. */
+        leadId: CFG.leadId,
+        estado: (e && e.estacional === true) ? 'SIN_DISPONIBILIDAD' : 'ERROR',
+        referencia: ultimaRef,
+        motivo: e.message.split(String.fromCharCode(10))[0],
       log: bitacoraTexto(),
     }, null, 1));
   } finally {
