@@ -44,6 +44,23 @@ const cola = [];
 const resultados = [];
 let procesando = false;
 
+/**
+ * Pausa tras un login fallido — guia V4, seccion 2: "esperar 10 minutos antes de
+ * reiniciar el ciclo". clonar.js ya hizo sus 2 intentos en 1 minuto y no entro.
+ *
+ * Se pausa la COLA ENTERA, no solo ese lead: si Tourplan no tiene licencia libre,
+ * el lead siguiente tampoco va a entrar, y seguir intentando cada pocos segundos no
+ * consigue licencia — solo le compite el turno al resto del equipo, que son 120-130
+ * personas para 75 licencias.
+ *
+ * El lead que fallo NO se vuelve a encolar aca a proposito. Salesforce lo devuelve a
+ * PENDIENTE al leer el resultado y lo reenvia en su proximo ciclo. Reencolarlo aca
+ * ademas lo haria correr dos veces, que es justamente el problema de doble disparo
+ * que ya arrastramos.
+ */
+const PAUSA_LOGIN_MS = 10 * 60_000;
+let pausadoHasta = 0;
+
 app.post('/procesar', (req, res) => {
   const lead = req.body || {};
   const id = lead.Id || lead.leadId;
@@ -60,7 +77,14 @@ app.get('/resultados', (req, res) => {
 });
 
 app.get('/estado', (req, res) => {
-  res.json({ ok: true, enCola: cola.length, procesando, resultadosListos: resultados.length });
+  // pausaLoginSeg se expone para no tener que leer el journal del servicio para
+  // saber por que la cola no avanza: es la pregunta que uno se hace primero.
+  const pausaSeg = Math.max(0, Math.ceil((pausadoHasta - Date.now()) / 1000));
+  res.json({
+    ok: true, enCola: cola.length, procesando,
+    resultadosListos: resultados.length,
+    pausaLoginSeg: pausaSeg,
+  });
 });
 
 /**
@@ -106,6 +130,9 @@ app.post('/link', async (req, res) => {
 
 async function procesarCola() {
   if (procesando || cola.length === 0) return;
+  // En pausa por login fallido: los leads quedan en la cola y salen solos cuando
+  // vence la espera. No se pierde ninguno.
+  if (Date.now() < pausadoHasta) return;
   procesando = true;
   const lead = cola.shift();
   const id = lead.Id || lead.leadId;
@@ -121,6 +148,17 @@ async function procesarCola() {
     }
     resultados.push({ leadId: id, ...r });
     log(`  -> ${id}: ${r.estado}${r.referencia ? ' / ' + r.referencia : ''}`);
+
+    if (r.estado === 'LOGIN_FALLIDO') {
+      pausadoHasta = Date.now() + PAUSA_LOGIN_MS;
+      log(`  ⏸ Login fallido -> cola en pausa ${PAUSA_LOGIN_MS / 60_000} min (guia V4 seccion 2). Salesforce le avisa a IT.`);
+      // unref: esta espera no debe impedir que el proceso termine si lo apagan.
+      setTimeout(() => {
+        pausadoHasta = 0;
+        log(`  ▶ Fin de la pausa por login: se reanuda la cola (${cola.length} en espera)`);
+        procesarCola();
+      }, PAUSA_LOGIN_MS).unref();
+    }
   } catch (e) {
     resultados.push({ leadId: id, estado: 'ERROR', motivo: String(e.message).slice(0, 400) });
     log(`  -> ${id}: ERROR ${String(e.message).split('\n')[0]}`);

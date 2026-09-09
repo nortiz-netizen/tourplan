@@ -160,7 +160,25 @@ async function cerrarModalSiAparece(page) {
 /** Fecha del intento: si no hay fecha configurada, 30 dias adelante. */
 const fechaIntento = (v, desplazar) => aDDMMAA(v || new Date(Date.now() + 30 * 86400_000), desplazar);
 
-async function login(page) {
+/**
+ * Politica de reintentos de login — guia V4, seccion 2: "realizar 2 intentos en el
+ * plazo de 1 minuto. Si el error persiste, enviar una alerta por correo electronico
+ * a it@sayhueque.com y esperar 10 minutos antes de reiniciar el ciclo."
+ *
+ * Hasta ahora esto vivia SOLO en login-smoke.js, que es el script de prueba: el robot
+ * de verdad intentaba una vez y se rendia. Y no es un caso raro — Tourplan tiene 75
+ * licencias concurrentes para 120-130 usuarios, asi que quedarse sin licencia (o
+ * entrar en QUERY MODE porque otra sesion la tiene tomada) es lo esperable a la hora
+ * pico. Ese fallo terminaba escrito como un ERROR generico mas y nadie se enteraba.
+ *
+ * Las dos partes que faltan (avisarle a IT, esperar 10 minutos) no van aca: el aviso
+ * lo manda Salesforce, que es quien tiene correo, y la espera la hace server.js, que
+ * es quien maneja la cola. Este proceso muere al terminar el lead.
+ */
+const LOGIN_MAX_INTENTOS = 2;
+const LOGIN_ESPERA_MS    = 30_000;   // 2 intentos separados por 30s = el minuto de la guia
+
+async function intentarLogin(page) {
   await page.goto(CFG.url, { waitUntil: 'domcontentloaded' });
   await esperarApp(page);
   const u = page.getByPlaceholder('Username');
@@ -174,7 +192,37 @@ async function login(page) {
   await esperarApp(page); await sleep(1500);
   const body = (await page.textContent('body')) || '';
   if (/query mode|modo consulta/i.test(body)) throw new Error('QUERY MODE: hay otra sesion activa con este usuario');
-  log('FASE 0 OK — sesion activa');
+}
+
+async function login(page) {
+  let ultimo = null;
+  for (let intento = 1; intento <= LOGIN_MAX_INTENTOS; intento++) {
+    try {
+      await intentarLogin(page);
+      log(`FASE 0 OK — sesion activa${intento > 1 ? ` (al intento ${intento})` : ''}`);
+      return;
+    } catch (e) {
+      ultimo = e;
+      log(`⚠ Login intento ${intento}/${LOGIN_MAX_INTENTOS} fallo: ${e.message.split('\n')[0]}`);
+      // Sin ventana no hay nada que reintentar: el segundo intento fallaria igual
+      // y solo agregaria 30s de espera inutil.
+      if (page.isClosed()) break;
+      if (intento < LOGIN_MAX_INTENTOS) {
+        log(`  Esperando ${LOGIN_ESPERA_MS / 1000}s antes de reintentar...`);
+        await sleep(LOGIN_ESPERA_MS);
+      }
+    }
+  }
+  // Se marca el error para que el resultado salga como LOGIN_FALLIDO y no como un
+  // ERROR generico. Salesforce necesita distinguirlo por dos motivos: para avisarle
+  // a IT, y para devolver el Lead a PENDIENTE en vez de darlo por perdido — que
+  // Tourplan no tuviera licencia libre no es culpa de este pasajero.
+  const err = new Error(
+    `LOGIN FALLIDO tras ${LOGIN_MAX_INTENTOS} intentos: ` +
+    (ultimo ? ultimo.message.split('\n')[0] : 'sin detalle')
+  );
+  err.loginFallido = true;
+  throw err;
 }
 
 /** Primer elemento realmente visible de un locator (no solo presente en el DOM). */
@@ -1395,8 +1443,13 @@ async function main() {
            Marcarlo como ERROR hacia que Salesforce lo tratara como falla del robot
            y el pasajero NO recibiera el mensaje Taylor Made: se quedaba esperando
            una cotizacion que nunca iba a llegar. */
+        /* Y un fallo de LOGIN tampoco es un error del lead: es Tourplan sin licencia
+           libre. Se distingue para que Salesforce le avise a IT y devuelva el Lead a
+           PENDIENTE, en vez de dejarlo tirado como si el robot no supiera cotizarlo. */
         leadId: CFG.leadId,
-        estado: (e && e.estacional === true) ? 'SIN_DISPONIBILIDAD' : 'ERROR',
+        estado: (e && e.loginFallido === true) ? 'LOGIN_FALLIDO'
+              : (e && e.estacional   === true) ? 'SIN_DISPONIBILIDAD'
+              : 'ERROR',
         referencia: ultimaRef,
         motivo: e.message.split(String.fromCharCode(10))[0],
       log: bitacoraTexto(),
