@@ -103,7 +103,9 @@ app.get('/estado', (req, res) => {
  * navegador, consulta el backend y devuelve lo que encontro; quien guarda es Apex.
  */
 app.post('/link', async (req, res) => {
-  const { referencia, site, idioma } = req.body || {};
+  // nombre = titular del booking que creo el robot: generarLink no devuelve el link si
+  // la reserva del backend (produccion) es de otro pasajero.
+  const { referencia, site, idioma, nombre } = req.body || {};
   if (!referencia) return res.status(400).json({ error: 'falta la referencia' });
 
   // No se pisa una corrida del robot: Tourplan es single-session y el backend usa
@@ -120,6 +122,7 @@ app.post('/link', async (req, res) => {
       referencia,
       site: site || 'sayhueque',
       idioma: idioma || 'EN',
+      nombre: nombre || null,
     });
     log(`  /link ${referencia} -> ${r.estado}${r.link ? ' / ' + r.link : ''}`);
     res.json(r);
