@@ -17,7 +17,10 @@
 import { chromium } from 'playwright';
 import dotenv from 'dotenv';
 import fs from 'node:fs';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { aDDMMAA, calcularHabitaciones } from './mapeo.js';
+import { datosDeReserva, cerrar as cerrarSql } from './tourplan-sql.js';
 import { generarLink, siteDesdeBackendLink } from './backend.js';
 dotenv.config();
 
@@ -492,8 +495,11 @@ async function faseHabitaciones(fp) {
     await sleep(800);
     const adultos = fp.locator('input.tpnumber-paxtypeadult').first();
     if (await adultos.count()) { await tipear(fp, adultos, pax); log(`  Adultos: ${pax}`); }
-    await captura(fp, '14_config_habitaciones'); await volcarElementos(fp, 'habitaciones');
-    log('  ⚠ Reparto en habitaciones dobles/single: verificar captura 14 (puede requerir ajuste fino)');
+    await captura(fp, '14_config_habitaciones');
+    // Aca Tourplan los deja a todos en una habitacion (4 = "Cuad"): es solo para que
+    // existan los pasajeros. El reparto de la guia se arma al insertar el itinerario
+    // (faseConfigurarHabitaciones), que es donde Tourplan permite varias habitaciones.
+    log('  Reparto en habitaciones: se arma al insertar el itinerario (Nueva Configuracion)');
   }
   await sleep(600);
   await captura(fp, '14b_habitaciones');
@@ -697,6 +703,64 @@ async function marcarOpcion(fp, textoExacto) {
   }, textoExacto).catch((e) => 'error: ' + e.message);
 }
 
+/**
+ * Guia 3.4: grupos pares en dobles; impares mayores a 3, una sencilla y el resto en
+ * dobles. Sin esto Tourplan mete a todos en una sola habitacion (4 pax = "Cuad") y
+ * muchos hoteles no tienen cuadruples.
+ *
+ * Se arma en el modal "Insertar Booking" -> "Nueva Configuracion de Pax" (mapeado en
+ * TEST el 24-09-2026): arriba un "+" por tipo de habitacion, abajo los pasajeros sin
+ * asignar con su "+". El "+" de un pasajero lo asigna a la ULTIMA habitacion agregada,
+ * asi que se va habitacion por habitacion: se agrega y se llena. OK se habilita recien
+ * cuando no queda nadie sin asignar, y al confirmar Tourplan selecciona sola la
+ * configuracion nueva (ej. "2 Dobles") para los servicios que se insertan.
+ *
+ * 1 y 2 pasajeros no pasan por aca: ya quedan en sencilla o doble al crear el booking.
+ */
+async function faseConfigurarHabitaciones(fp) {
+  const pax = CFG.paxCantidad;
+  if (!pax || pax <= 2) return;
+  const { dobles, singles } = calcularHabitaciones(pax);
+  const plan = [
+    ...Array(singles).fill({ clase: 'tproomtypesg', nombre: 'Sencilla', pax: 1 }),
+    ...Array(dobles).fill({ clase: 'tproomtypedb', nombre: 'Doble', pax: 2 }),
+  ];
+  log(`  Habitaciones: ${pax} pax -> ${plan.map(h => h.nombre).join(' + ')}`);
+
+  const abrir = fp.getByRole('button', { name: /nueva\s+configuraci[oó]n/i }).last();
+  if (!(await abrir.count().catch(() => 0))) throw new Error('No encontre "Nueva Configuracion" en Insertar Booking (paso 3.4).');
+  await abrir.click({ timeout: 8000 });
+  await esperarApp(fp); await sleep(1500);
+
+  const sinAsignar = () => fp.locator('button.tpbutton-addpax.tppaxlist');
+  for (const hab of plan) {
+    await fp.locator(`button.tpbutton-addroom.${hab.clase}`).last().click({ timeout: 8000 });
+    await sleep(1000);
+    for (let p = 0; p < hab.pax; p++) {
+      await sinAsignar().first().click({ timeout: 8000 });
+      await sleep(800);
+    }
+  }
+  const quedan = await sinAsignar().count().catch(() => -1);
+  await captura(fp, '17h_habitaciones');
+
+  const ok = fp.locator('button.tpok').last();
+  if (quedan !== 0 || !(await ok.isEnabled().catch(() => false))) {
+    throw new Error(`No se pudo armar ${plan.map(h => h.nombre).join(' + ')} (quedan ${quedan} pax sin habitacion) — paso 3.4. Ver captura 17h.`);
+  }
+  await ok.click({ timeout: 8000 });
+  await esperarApp(fp); await sleep(1500);
+
+  // Lo que quedo seleccionado para insertar tiene que ser exactamente ese reparto.
+  const desc = (await fp.locator('li.config-desc').last().textContent().catch(() => '')) || '';
+  const cuenta = (tipo) => (desc.match(new RegExp('\\b' + tipo + '\\b', 'gi')) || []).length;
+  await captura(fp, '17i_habitaciones_ok');
+  if (cuenta('Doble') !== dobles || cuenta('Sencilla') !== singles) {
+    throw new Error(`La configuracion elegida no es ${dobles} doble(s) + ${singles} sencilla(s): "${desc.slice(0, 120)}" (paso 3.4).`);
+  }
+  log(`  Configuracion de pax: ${dobles} doble(s) + ${singles} sencilla(s) OK`);
+}
+
 async function faseInsertarServicios(fp) {
   if (!CFG.fileOrigen) throw new Error('FALTA TP_FILE_ORIGEN en .env — el codigo del file a clonar (viene de la consulta SQL). Sin el no hay paso 3.5.');
 
@@ -845,6 +909,22 @@ async function faseInsertarServicios(fp) {
   }
   await captura(fp, '17e_referencia_resuelta');
 
+  // 3.5.e2 — "verificando que sea la coincidencia exacta" (guia 3.5). La referencia
+  // sola no alcanza: en Tourplan TEST (copia de produccion del 08-08-2026) los numeros
+  // posteriores a la copia son OTROS bookings, y el robot copiaba sin enterarse un
+  // itinerario distinto al elegido. Se compara el nombre que resolvio Tourplan con el
+  // del file en la base (lo lee main() antes de empezar).
+  const nombreElegido = (await nombreModal.inputValue().catch(() => '')).trim();
+  if (!nombreElegido) {
+    throw new Error(`El file ${codigo} no existe en este Tourplan: la referencia no resolvio ningun booking (paso 3.5).`);
+  }
+  const normNombre = (s) => String(s || '').trim().toLowerCase().replace(/\s+/g, ' ');
+  if (CFG.fileOrigenNombre && normNombre(nombreElegido) !== normNombre(CFG.fileOrigenNombre)) {
+    throw new Error(`El file ${codigo} en este Tourplan es otro itinerario ("${nombreElegido}"), no ` +
+      `"${CFG.fileOrigenNombre}". No se copia para no mandar un itinerario equivocado (paso 3.5).`);
+  }
+  log(`  File verificado: ${codigo} = "${nombreElegido}"` + (CFG.fileOrigenNombre ? ' (coincide con la base)' : ' (sin nombre de la base para comparar)'));
+
   // 3.5.f — INSERTAR TIPO debe quedar en "Insertar", nunca en "Mezclar":
   // Mezclar pisa los servicios existentes en vez de agregarlos. Viene marcado
   // asi por defecto (es el primer radio), pero se fuerza por las dudas.
@@ -869,6 +949,9 @@ async function faseInsertarServicios(fp) {
       '" / "' + (await sec.inputValue().catch(() => '?')) + '"');
   await sleep(400);
   await captura(fp, '17e_parametros');
+
+  // 3.4 — reparto en habitaciones para 3 pax o mas (desde "Nueva Configuracion").
+  await faseConfigurarHabitaciones(fp);
 
   // 3.5.g — confirmar la insercion
   // En este modal el boton de confirmar es GUARDAR (arriba a la derecha), y
@@ -1245,22 +1328,24 @@ async function faseOcultarPrecios(fp) {
     'Configuracion general'
   );
   await captura(fp, '19_analisis'); await volcarElementos(fp, 'analisis');
+  // Una cotizacion con precios visibles NO puede seguir de largo: el paso siguiente
+  // es generar el link y mandarselo al pasajero. Antes esto solo quedaba en el log
+  // y la corrida terminaba OK igual.
   if (!entro) {
-    log('  ! No pude llegar a Configuracion general — el booking queda CON precios visibles');
     await fp.evaluate(() => { document.documentElement.style.zoom = '1'; }).catch(() => {});
-    log('FASE 3.6b incompleta (revisar captura 19)');
-    return;
+    throw new Error('No pude llegar a Configuracion general para ocultar los precios (paso 3.6b): no se manda una cotizacion con precios visibles. Ver captura 19.');
   }
 
   // Es un campo-lista de Tourplan (input con dropdown propio), no un <select>:
   // por eso selectOption no encontraba ninguna opcion. Se reutiliza el helper
   // que ya resuelve AGENCIA / MONEDA / DIVISION. Codigo "2" = NO.
   const ok = await seleccionarEnLista(fp, 'Mostrar precios', '2');
-  log(ok ? '  "Mostrar precios" -> 2 - NO ok'
-         : '  ! No pude dejar "Mostrar precios" en NO — la cotizacion saldria CON precios');
-
   await fp.evaluate(() => { document.documentElement.style.zoom = '1'; }).catch(() => {});
   await captura(fp, '19b_mostrar_precios');
+  if (!ok) {
+    throw new Error('No pude dejar "Mostrar precios" en NO (paso 3.6b): no se manda una cotizacion con precios visibles. Ver captura 19b.');
+  }
+  log('  "Mostrar precios" -> 2 - NO ok');
   log('FASE 3.6b hecha');
 }
 
@@ -1272,16 +1357,29 @@ async function faseGuardarYCerrar(fp, page, refAntes) {
   if (!(await guardar.count().catch(() => 0))) {
     guardar = fp.getByRole('button', { name: /^\s*guardar\s*$/i }).last();
   }
-  if (await guardar.count().catch(() => 0)) {
-    await guardar.click({ timeout: 10000, force: true })
-      .then(() => log('  Cambios guardados'))
-      .catch((e) => log('  ! No pude clickear Guardar: ' + String(e.message).split('\n')[0].slice(0, 60)));
-    await esperarApp(fp); await sleep(1500); await cerrarModalSiAparece(fp);
-  } else {
-    log('  ! No encontre el boton Guardar final');
+  if (!(await guardar.count().catch(() => 0))) {
+    throw new Error('No encontre el boton Guardar final (paso 3.8): el file no quedo guardado.');
   }
+  await guardar.click({ timeout: 10000, force: true }).catch((e) => {
+    throw new Error('No pude clickear Guardar (paso 3.8): ' + String(e.message).split('\n')[0].slice(0, 80));
+  });
+  log('  Cambios guardados');
+  await esperarApp(fp); await sleep(1500); await cerrarModalSiAparece(fp);
+
+  // Paso 3.8: "verificar que el numero de referencia del nuevo file haya cambiado".
+  // El que queda en pantalla tiene que ser el booking NUEVO (el numero que asigno
+  // Tourplan al crearlo), nunca el file origen que se copio. Al crearlo se lee
+  // "128080" y en la cabecera aparece "WEFI128080": se comparan los numeros.
   const refDespues = await capturarReferencia(fp);
-  if (refAntes && refDespues && refAntes === refDespues) log('  Referencia verificada: ' + refDespues);
+  const numero = (r) => String(r || '').replace(/\D/g, '');
+  if (!refDespues) throw new Error('No pude leer la referencia del file nuevo despues de guardar (paso 3.8).');
+  if (numero(refDespues) === numero(CFG.fileOrigen)) {
+    throw new Error(`La referencia en pantalla (${refDespues}) es la del file ORIGEN, no la del nuevo (paso 3.8).`);
+  }
+  if (refAntes && numero(refAntes) && numero(refDespues) !== numero(refAntes)) {
+    throw new Error(`La referencia cambio de ${refAntes} a ${refDespues} al guardar (paso 3.8): no es el booking que se creo.`);
+  }
+  log('  Referencia verificada: ' + refDespues + ' (nueva, distinta del origen ' + CFG.fileOrigen + ')');
   await captura(fp, '20_final');
   // Cerrar pestana FITs (regla de licencias) — el cierre se hace desde la pestana de inicio
   if (fp !== page && !fp.isClosed()) await fp.close().catch(() => {});
@@ -1305,6 +1403,27 @@ async function main() {
       log: bitacoraTexto(),
     }, null, 1));
     process.exit(0);
+  }
+
+  // Datos del file origen desde la base de Tourplan: el nombre para verificar que se
+  // copia el itinerario correcto (paso 3.5) y su fecha de viaje, que es la "fecha
+  // original" del ultimo intento del protocolo de disponibilidad (seccion 4). Si la
+  // base no responde se sigue igual, solo que sin esas dos verificaciones.
+  if (CFG.fileOrigen) {
+    try {
+      const d = await datosDeReserva(CFG.fileOrigen);
+      if (d) {
+        CFG.fileOrigenNombre = d.nombre || null;
+        CFG.fileOrigenFecha = d.fechaViaje ? new Date(d.fechaViaje).toISOString().slice(0, 10) : null;
+        log(`File origen ${CFG.fileOrigen}: "${CFG.fileOrigenNombre}" (viaje original ${CFG.fileOrigenFecha ?? 'sin fecha'})`);
+      } else {
+        log(`⚠ El file ${CFG.fileOrigen} no esta en la base de Tourplan: no se puede verificar su nombre`);
+      }
+    } catch (e) {
+      log('⚠ Sin acceso a la base de Tourplan (' + String(e.message).split('\n')[0] + '): no se verifica el nombre del file');
+    } finally {
+      await cerrarSql();
+    }
   }
 
   // HEADLESS: en tu PC va visible (para ver/depurar). En AWS (sin pantalla) tiene
@@ -1349,19 +1468,22 @@ async function main() {
     //   1) la fecha que pidio el pasajero
     //   2) +1 dia
     //   3) +2 dias   (la guia permite "hasta 2 intentos desplazando la fecha")
-    //   4) vuelta a la fecha ORIGINAL, y si valida, se ocultan las fechas para
-    //      poder mandar igual la cotizacion
+    //   4) "la misma fecha original de su creacion": la fecha de viaje del
+    //      ITINERARIO que se copia, donde sus servicios si operaban. Si valida, se
+    //      ocultan las fechas para poder mandar igual la cotizacion. Antes este paso
+    //      repetia la fecha del pasajero, que ya habia fallado en el intento 1.
     // Si despues de eso siguen las lineas rojas -> abortar y derivar a Taylor Made.
     const PLAN = [
       { dias: 0, ocultarFechas: false, nota: 'fecha pedida' },
       { dias: 1, ocultarFechas: false, nota: '+1 dia' },
       { dias: 2, ocultarFechas: false, nota: '+2 dias' },
-      { dias: 0, ocultarFechas: true,  nota: 'fecha original, ocultando fechas' },
+      { dias: 0, ocultarFechas: true,  nota: 'fecha original del itinerario, ocultando fechas', original: true },
     ];
-    let exito = false, refFinal = null, fechaUsada = null, fechasOcultas = false;
+    let exito = false, refFinal = null, fechaUsada = null, fechasOcultas = false, fechaDelItinerario = false;
     for (let i = 0; i < PLAN.length && !exito; i++) {
       const paso  = PLAN[i];
-      const fecha = fechaIntento(CFG.fechaViaje, paso.dias);
+      const usarOriginal = !!(paso.original && CFG.fileOrigenFecha);
+      const fecha = usarOriginal ? aDDMMAA(CFG.fileOrigenFecha) : fechaIntento(CFG.fechaViaje, paso.dias);
       log(`\n===== INTENTO ${i + 1}/${PLAN.length} — ${paso.nota} (${fecha}) =====`);
       try {
         fitsPage = await faseNavegarFits(page, context);
@@ -1382,6 +1504,7 @@ async function main() {
         if (paso.ocultarFechas) { await faseOcultarFechas(fitsPage); fechasOcultas = true; }
         refFinal = await faseGuardarYCerrar(fitsPage, page, ref);
         fechaUsada = fecha;
+        fechaDelItinerario = usarOriginal;
         exito = true;
       } catch (e) {
         if (e.estacional && i < PLAN.length - 1) {
@@ -1406,6 +1529,7 @@ async function main() {
           referencia: refBackend,
           site: siteDesdeBackendLink(CFG.backendLink),
           idioma: CFG.idiomaBackend,
+          nombre: CFG.paxNombre,   // la fila del backend tiene que ser de este pasajero
         }).catch(e => ({ estado: 'ERROR', motivo: String(e.message).split('\n')[0] }));
         if (rb.estado === 'OK' && rb.link) { linkItinerario = rb.link; log(`  ✅ Link: ${linkItinerario}`); }
         else { backendMotivo = rb.motivo || rb.estado; log(`  ⚠ Backend sin link: ${backendMotivo}`); }
@@ -1419,6 +1543,8 @@ async function main() {
         // tiene que enterarse ANTES de mandarle la cotizacion al pasajero.
         fechaViajeUsada: ddmmaaAIso(fechaUsada),
         fechasOcultas,
+        // true = se inserto en la fecha original del itinerario copiado (seccion 4)
+        fechaDelItinerario,
         log: bitacoraTexto(),
       }, null, 1));
     } else {
@@ -1461,4 +1587,12 @@ async function main() {
   }
 }
 
-main();
+// Se puede importar (por ejemplo, para explorar una pantalla de Tourplan sin clonar
+// nada) sin que arranque el robot: main() corre solo si se ejecuta este archivo.
+export {
+  CFG, log, sleep, captura, volcarElementos, esperarApp, login, logout,
+  faseNavegarFits, faseNuevoBooking, faseCamposIniciales, campoPorEtiqueta, seleccionarEnLista, tipear,
+};
+const ejecutadoDirecto = process.argv[1]
+  && path.resolve(process.argv[1]).toLowerCase() === fileURLToPath(import.meta.url).toLowerCase();
+if (ejecutadoDirecto) main();

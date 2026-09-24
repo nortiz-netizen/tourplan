@@ -54,7 +54,7 @@ export function siteDesdeBackendLink(backendLink) {
  * Recibe un `browser` de Playwright ya abierto (lo reusa el scraper) para no
  * levantar otro. Devuelve { estado, link, motivo }.
  */
-export async function generarLink(browser, { referencia, site = 'sayhueque', idioma = 'EN' }) {
+export async function generarLink(browser, { referencia, site = 'sayhueque', idioma = 'EN', nombre = null }) {
   if (!referencia) return { estado: 'ERROR', motivo: 'Sin referencia para el backend' };
   if (!URL || !USER || !PASS) return { estado: 'ERROR', motivo: 'Faltan BACKEND_URL/USER/PASS en .env' };
 
@@ -117,6 +117,32 @@ export async function generarLink(browser, { referencia, site = 'sayhueque', idi
       // 2) el que la trae en cualquier parte de la URL
       return urls.find(u => u.toUpperCase().includes(ref.toUpperCase())) || null;
     }, ref).catch(() => null);
+
+    // La referencia sola tampoco alcanza: el backend es PRODUCCION y el robot puede
+    // estar trabajando en Tourplan TEST, donde los numeros nuevos son otras reservas.
+    // Paso de verdad (22-09-2026): el robot creo WEFI128079 en TEST para "Matias
+    // Fernandez" y el backend devolvio el link de WEFI128079 de produccion, que es
+    // "Ali Zamza - Shared City Tour in Buenos Aires". Ese link le habria llegado al
+    // pasajero. Se exige que la fila del backend sea del mismo pasajero.
+    if (link && nombre) {
+      const fila = await page.evaluate((ref) => {
+        const tr = [...document.querySelectorAll('tr')]
+          .find(t => [...t.querySelectorAll('td')].some(td => (td.textContent || '').trim().toUpperCase() === ref.toUpperCase()));
+        if (!tr) return null;
+        const celdas = [...tr.querySelectorAll('td')].map(td => (td.textContent || '').trim());
+        return { nombre: celdas[0] || '', alias: celdas[3] || '' };
+      }, ref).catch(() => null);
+      const norm = (s) => String(s || '').trim().toLowerCase().replace(/\s+/g, ' ');
+      if (!fila || norm(fila.nombre) !== norm(nombre)) {
+        const visto = fila ? `"${fila.nombre}"${fila.alias ? ' - ' + fila.alias : ''}` : 'ninguna fila con esa referencia';
+        log(`  ⚠ La referencia ${ref} en el backend es de otra reserva (${visto}), no de "${nombre}": no se usa ese link`);
+        return {
+          estado: 'SIN_LINK',
+          motivo: `En el backend la referencia ${ref} corresponde a otra reserva (${visto}), no a "${nombre}". ` +
+                  'Pasa cuando el robot trabaja en Tourplan TEST y el backend es produccion: no se manda un link equivocado.',
+        };
+      }
+    }
 
     if (link) { log(`  ✅ Link generado: ${link}`); return { estado: 'OK', link }; }
 

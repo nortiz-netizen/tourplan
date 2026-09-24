@@ -12,6 +12,8 @@
  *   POST /procesar   body = {campos del lead}  -> encola, devuelve {estado:'encolado'}
  *   GET  /resultados                           -> devuelve y LIMPIA los resultados listos
  *   GET  /estado                               -> salud + tamano de cola (sin token)
+ *   GET  /itinerarios?desde=&pagina=&tam=      -> una pagina del catalogo de itinerarios
+ *                                                 (BD SQL de Tourplan, ver itinerarios.js)
  *
  * Correr:  npm run server   (o node src/server.js)
  */
@@ -22,6 +24,7 @@ import dotenv from 'dotenv';
 import { chromium } from 'playwright';
 import { leadATourplan } from './mapeo.js';
 import { generarLink } from './backend.js';
+import { paginaDeItinerarios, TAM_DEFECTO, TAM_MAXIMO } from './itinerarios.js';
 dotenv.config();
 
 const PORT  = parseInt(process.env.SCRAPER_PORT || '3000', 10);
@@ -125,6 +128,30 @@ app.post('/link', async (req, res) => {
     res.json({ estado: 'ERROR', motivo: String(e.message).split('\n')[0] });
   } finally {
     if (browser) await browser.close().catch(() => {});
+  }
+});
+
+/**
+ * GET /itinerarios?desde=2026-08-01T00:00:00Z&pagina=0&tam=2000
+ *   -> { hayMas, pagina, filas: [{ BookingReference__c, ... }] }
+ *
+ * Salesforce lo llama una vez al dia y guarda las filas en Itinierario__c. Va por
+ * SQL, no por navegador: no usa licencia de Tourplan ni compite con el robot, asi
+ * que no pasa por la cola.
+ */
+app.get('/itinerarios', async (req, res) => {
+  const desde = req.query.desde ? new Date(String(req.query.desde)) : null;
+  if (desde && Number.isNaN(desde.getTime())) return res.status(400).json({ error: 'desde no es una fecha valida' });
+  const pagina = Math.max(0, parseInt(req.query.pagina || '0', 10) || 0);
+  const tam = Math.min(TAM_MAXIMO, Math.max(1, parseInt(req.query.tam || String(TAM_DEFECTO), 10) || TAM_DEFECTO));
+  try {
+    const r = await paginaDeItinerarios({ desde, pagina, tam });
+    log(`  /itinerarios desde=${desde ? desde.toISOString().slice(0, 10) : 'todo'} pag=${pagina} -> ${r.filas.length}${r.hayMas ? ' (hay mas)' : ''}`);
+    res.json({ pagina, ...r });
+  } catch (e) {
+    const motivo = `${e.code ? e.code + ': ' : ''}${String(e.message).split('\n')[0]}`;
+    log(`  /itinerarios -> ERROR ${motivo}`);
+    res.status(502).json({ error: motivo });
   }
 });
 

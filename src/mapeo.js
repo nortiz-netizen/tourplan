@@ -51,14 +51,16 @@ const DEPTO_POR_TIPO_CLIENTE = {
 const DEPTO_DEFAULT = 'FI';   // FIT's
 
 /**
- * Agencia segun el origen del lead (guia 3.3).
- * ⚠️ FALTA EL DATO DE SAY: cual es el codigo de agencia para un cliente directo
- * de la web. La lista de Tourplan tiene cientos (000661 Elcano Tours, 1 10Adventures...).
- * Mientras no lo tengamos, se usa TP_AGENCIA del .env como provisorio.
+ * Agencia segun el origen del lead (guia 3.3). Sale de la base de Tourplan (24-09-2026):
+ * de las cotizaciones web, 14.292 estan en 657 "Consumidor Final Web" y las de la marca
+ * SouthAmerica.Travel en 493. Antes se usaba el provisorio del .env ("1"), que en
+ * Tourplan es la agencia externa "10Adventures".
  */
 const AGENCIA_POR_ORIGEN = {
-  // 'Valentín': '???',   ← pendiente de confirmar con Say
+  'SAT':                  '493',   // SouthAmerica.Travel
+  'South America Travel': '493',
 };
+const AGENCIA_DEFAULT = '657';     // Consumidor Final Web (cliente directo)
 
 /** Moneda. ⚠️ A CONFIRMAR con Say si varia por origen/idioma del cliente. */
 const MONEDA_DEFAULT = 'USD';
@@ -166,7 +168,7 @@ export function leadATourplan(lead, extra = {}) {
   const division = DIVISION_POR_ORIGEN[lead.LeadSource] || DIVISION_DEFAULT;
   const depto    = DEPTO_POR_TIPO_CLIENTE[lead.Customer_Type__c] || DEPTO_DEFAULT;
   const agencia  = extra.agencia || lead.Agencia_Tourplan__c
-                   || AGENCIA_POR_ORIGEN[lead.LeadSource] || '';
+                   || AGENCIA_POR_ORIGEN[lead.LeadSource] || AGENCIA_DEFAULT;
   const moneda   = extra.moneda || MONEDA_DEFAULT;
   const backend  = BACKEND_POR_ORIGEN[lead.LeadSource] || BACKEND_DEFAULT;
 
